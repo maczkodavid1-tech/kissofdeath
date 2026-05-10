@@ -119,13 +119,6 @@ Adatáramlás: Építés a végrehajtásig
 
 Ez az ábra azt mutatja, hogy a kódegységek hogyan kerülnek a végső végrehajtási környezetbe a build rendszer lépésein keresztül.
 
-Elutasíthatod
-
-Frissítse ezt a wikit
-
-Ez a wiki nemrégiben frissült. Kérjük, várjon 7 napot az újbóli frissítéshez.
-
-### Ezen az oldalon
 
 ## Képzési és telepítési szkriptek
 
@@ -2453,3 +2446,123 @@ Az optimalizáló kiterjesztése, amely Hutchinson Hessian becslést tartalmaz a
 | OFTB | Orthogonal Fractal Transform Block | Paramétermentes Haar-wavelet keverési réteg. | src/processor/oftb.zig | src/processor/oftb.zig
 | RSF | Reversible Scatter Flow | Az alapvető bijektív neurális architektúra. | src/processor/rsf.zig |
 | SSI | Structured Sequence Index | A nagysebességű vektor/szekvencia adatbázis. | src/index/ssi.zig |
+
+
+ 1. Bevezet-e az RSF egy alapvetően új számítási primitív elemet?
+
+IGEN: A primitív elem a kereszt-affin kapcsolás: a `computeScaleRow` kiszámítja az `exp(clip(W_s·x2 + b_s))` értéket, és megszorozza az `x1`-et; a `computeTranslationRow` kiszámítja a `W_t·y1 + b_t` értéket, és hozzáadja az `x2`-hez. Ez nem egy meglévő primitív módosítása.  
+
+A `LayerCore` struktúra kizárólag `s_weight`, `t_weight`, `s_bias`, `t_bias` elemeket tartalmaz — nincs figyelemmátrix, nincs konvolúciós kernel, nincs rejtett állapot.  
+
+A Twelf bizonyítás a `layer-weights`-et a következőképpen definiálja: `mk-lw : {D:nat} mat D D -> mat D D -> vec D -> vec D -> clip-range -> layer-weights` — pontosan 2 súlymátrix + 2 biasvektor + clip-range, semmi más.  
+
+---
+
+ 2. Az RSF meghatározza-e a meglévő architektúrákra nem redukálható, különálló információáramlási topológiát?
+
+IGEN: A topológia a következő: a bemenet felosztása `(x1, x2)`-re, `x1` transzformálása `x2` függvényében, `x2` transzformálása a módosított `x1` függvényében. Ez a keresztkapcsolás szerkezetileg eltér az önfigyeléstől (`Q·K^T·V`), a konvolúciótól (helyi befogadó mező) vagy a rekurziótól (szekvenciális állapot). Az `inverseInPlace` a pontos algebrai inverz – ez a Transformer átkötésével nem érhető el.  
+
+A Twelf `coupling-invertibility` bizonyítása igazolja, hogy ez a topológia típus szinten bijektív.  
+
+---
+
+ 3. Mutat-e az RSF az architektúrájából fakadó új skálázási törvényt?
+
+IGEN: A `calculateTotalParams` rétegenként `dim² × 4 + dim × 2` értéket számol ki – pontosan 4 súlymátrixot + 2 bias-t. A visszafelé irányuló lépés O(1) memóriát igényel, függetlenül a rétegek számától: a `backwardOnCore` újra futtatja a `forwardOnCore`-t a bemeneten, majd fordított sorrendben végigfut a rétegeken, meghívva a `backwardFromOutputs`-t, amely a kimenetekből inline módon rekonstruálja az `x1`/`x2`-t — aktivációs tárolás nélkül.   
+
+A Cryptol specifikáció megerősíti: `calculateTotalParams dim rétegek = (dim_sq * 4 + dim * 2) * rétegek`.  
+
+---
+
+ 4. Rendelkezik-e az RSF független reprezentációs bias-szal?
+
+IGEN: Az induktív torzítás bijektív kereszt-affin kapcsolás: a skála `x2`-re vonatkozik, hogy `x1`-et transzformálja; a transzláció a módosított `x1`-re vonatkozik, hogy `x2`-t transzformálja. Ez egy keresztkapcsolási torzítás, amely az összes korábbi családból hiányzik. Az `OFTB` hozzáad egy paramétermentes Haar-wavelet szórási torzítást (`fractal_scale = 0.70710678`).  
+
+---
+
+ 5. Bevezet-e az RSF új aszimptotikus viselkedést a memóriában, a kommunikációban vagy a számításban?
+
+IGEN: O(1) visszafelé irányuló memória: a `backwardFromOutputs` csak `y1`-et, `y2`-t (kimeneteket) és `dy1_in`-t, `dy2_in`-t (gradiensek) fogad. Inline módon rekonstruálja az `x2_row[d] = y2_row[d] - trans_sum` és az `x1_row[d2] = y1_row[d2] / scale` értékeket. A rétegek között nem tárolnak aktivációs tenzorokat.  
+
+A Futhark GPU-kernel, az `rsf_backward_flow` tárolt aktivációk nélkül is képes rekonstruálni a kimeneteket.  
+
+---
+
+ 6. Általánosan alkalmazható-e az RSF számos területen?
+
+IGEN: A kód bemutatja: szöveg (magyar JSONL a `HuggingFaceFW/finephrase` segítségével), több GPU-s képzés, következtetési szerver, ZK-bizonyítékok, kvantumintegráció. A `FullInferenceProof` circom sablon elfogadja a `tokens[dim]` és a `layer_weights_s/t[num_layers][dim][dim]` — területfüggetlen bemeneteket.  
+
+Az `rsf_relational_context` Futhark függvény RSF-kapcsolást alkalmaz tetszőleges szekvenciaadatokra.  
+
+---
+
+ 7. Szolgálhat-e az RSF univerzális gerinchálózat-családként?
+
+IGEN: A kódbázis 5 különböző belépési pontot tartalmaz, amelyek az RSF-et használják gerincként: `main.zig` (interaktív/edzés), `main_gpu.zig` (egy H100, `dim=2048, layers=48`), `main_distributed_futhark.zig` (több GPU-s B200, NCCL), `inference_server_main.zig` (HTTP API) és `main_distributed.zig` (CPU-el osztott).   
+
+---
+
+ 8. Kialakulhat-e az RSF-ből egy származtatott modellekből álló ökoszisztéma?
+
+IGEN: A kódbázis már tartalmazza: RSF + OFTB scatter, RSF + NSIR moduláció (`nsirModulateInPlace` `NSIR_MODULATION_FACTOR = 1.05` értékkel), RSF + SFD optimalizáló, RSF + SophiaSOAP, RSF + ZK bizonyítékok, RSF + kvantumintegráció. A `flattenRSFParams` azt mutatja, hogy az RSF paraméterei laposak és összetették.   
+
+---
+
+ 9. Megmarad-e az RSF architektúrájának identitása a különböző implementációk és modellméretek között?
+
+IGEN: Ugyanaz a 4-tenzoros szerkezet azonos formában jelenik meg a következőkben:
+- CPU Zig: `LayerCore`, amely tartalmazza az `s_weight`, `t_weight`, `s_bias`, `t_bias` elemeket
+- GPU Futhark F32: az `rsf_flow` elfogadja az `s_weight`, `t_weight`, `s_bias`, `t_bias` értékeket
+- GPU Futhark F16: a `training_step` elfogadja a `weights_s`, `weights_t`, `s_bias`, `t_bias` értékeket
+- ZK áramkör: a `FullInferenceProof` a `layer_weights_s`, `layer_weights_t` paramétereket használja
+- Cryptol: az `RSFLayer` típusnak vannak `s_weight`, `t_weight`, `s_bias`, `t_bias` paraméterei   
+
+---
+
+ 10. Az RSF egyértelműen elkülöníthető-e az optimalizálási vagy a képzési trükköktől?
+
+IGEN: A `LayerCore.forwardInPlace` és az `inverseInPlace` nem tartalmaz optimalizáló kódot. Az SFD optimalizáló egy teljesen különálló modul. Az OFTB egy különálló modul. Az RSF bijektivitása az optimalizálótól függetlenül érvényes — a `verifyInvertible` ezt futásidőben ellenőrzi, függetlenül bármilyen edzési állapottól.  
+
+---
+
+ 11. Bevezet-e az RSF új mechanizmust a kontextusintegrációhoz?
+
+IGEN: Az `rsf_scatter` Futhark függvény megvalósítja a Haar-wavelet pillangókeverést: `inv_sqrt2 * (x[j] + x[j+half])` az összegek esetében, `inv_sqrt2 * (x[j] - x[j+half])` a különbségek esetében, rétegenként változó permutációs indexekkel. Ez globális kontextust biztosít O(N²) figyelem nélkül.  
+
+---
+
+ 12. Bevezet-e az RSF új mechanizmust a relációs vagy hierarchikus feldolgozáshoz?
+
+IGEN: A `SelfSimilarRelationalGraph` (NSIR) `EdgeQuality` típusokkal (`superposition`, `entangled`, `coherent`, `collapsed`, `fractal`) kvantumállapot-relációs feldolgozást biztosít az RSF aktivációk tetején. A `ReasoningOrchestrator` háromszintű hierarchikus következtetést futtat (`fast_inner_steps=50`, `slow_outer_steps=10`, `hierarchical_depth=3`).   
+
+---
+
+ 13. Meghatározza-e az RSF a saját induktív torzítások osztályát?
+
+IGEN: Három különböző induktív torzítás a kódból:
+1. Bijektív kereszt-affin kapcsolás — az információ nem összeomolhat (bizonyítva a Mizar `ThForwardInverseIdentity`-ben)
+2. Paramétermentes Haar-wavelet szórás — OFTB `fractal_scale = 0.70710678` értékkel, tanulható paraméterek nélkül
+3. Klip-határolt skála gradiens — `ds_row[d2] = 0.0` a klip tartományon kívül, strukturális gradiens robusztusság  
+
+---
+
+ 14. Az RSF képes-e az architektúrájának köszönhetően bizonyos problématípusoknál jobb teljesítményt nyújtani a korábbi családoknál?
+
+Architektúra szempontjából igen, a „fix VRAM-méret mellett változó mélység” esetében. Az O(1) visszafelé irányuló memóriaterhelés azt jelenti, hogy az RSF tetszőleges számú réteggel képes tanulni fix VRAM-méret mellett. A `main_gpu.zig` a H100-on (80 GB) `dim=2048, layers=48` beállításokat használ; az elosztott tréner a B200-at (192 GB) célozza meg. Az azonos VRAM-kapacitással rendelkező Transformer-t az O(L) aktivációs tároló korlátozza. Hogy ez a feladat teljesítményében is megmutatkozik-e, azt a kód nem bizonyítja.  
+
+---
+
+ 15. Van-e az RSF-nek elméleti alapja, amely megmagyarázza, miért viselkedik másképp?
+
+IGEN: Négy független formális bizonyítás:
+
+- Mizar `ThForwardInverseIdentity`: 17 lépéses algebrai bizonyítás (A5–A17), miszerint `InverseInPlace(ForwardInPlace(x1,x2)) = (x1,x2)`. `ThCoreForwardInverseIdentity`: teljes modellszint.
+- Twelf `coupling-invertibility`: a bijekció típuselméleti bizonyítása.
+- Lean 4 `FloatInterface`: több mint 40 axióma, beleértve a `divF_mulF_inv` és a `mulF_divF_cancel` axiómákat, amelyek lehetővé teszik az inverz bizonyítás működését.
+- Beluga regiszterállapot-gép: `reg-alive`, `reg-freed`, `transition` típusok, amelyek bizonyítják, hogy a szabadítás utáni használat strukturálisan lehetetlen. 
+
+---
+
+16. Az RSF jelentősen eltérő kifejezőképességet biztosít-e a korábbi architektúrákhoz képest?
+
+IGEN: A bijektív korlátozás azt jelenti, hogy az RSF nem tudja összevonni az információkat – minden bemenet egy egyedi kimenethez rendelődik (bizonyítva). A transzformátorok összevonhatják az információkat (az attention az összes súlyt egy tokenhez rendelheti). A `verifyInvertible` futásidejű ellenőrzés ezt strukturálisan is megerősíti. A Lean 4 `FloatInterface.divF_mulF_inv` axióma az algebrai alapja ennek. 
