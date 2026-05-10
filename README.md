@@ -1,6 +1,7 @@
 ## JAIDE áttekintés
 
-A JAIDE (v40) egy kvantum-klasszikus hibrid nagy nyelvi modell, amely az alapoktól kezdve a Reversible Scatter Flow (RSF) paradigma megvalósítására épült A hagyományos transzformátor vagy CNN architektúrákkal ellentétben a JAIDE bijektív csatolási rétegeket használ, amelyek lehetővé teszik az O(1) memória visszaterjedést és egy paramétermentes Haar-wavelet keverő blokkot, amelyet OFTB-nek neveznek
+A JAIDE (v40) egy kvantum-klasszikus hibrid nagy nyelvi modell, amely az alapoktól kezdve a Reversible Scatter Flow (RSF) paradigma megvalósítására épült.
+A hagyományos transzformátor vagy CNN architektúrákkal ellentétben a JAIDE bijektív csatolási rétegeket használ, amelyek lehetővé teszik az O(1) memória visszaterjedést és egy paramétermentes Haar-wavelet keverő blokkot, amelyet OFTB-nek neveznek
 
 A rendszert nagy teljesítményű futtatásra tervezték különböző hardvereken, a szabványos CPU-któl kezdve a több GPU-s B200 klasztereken át a szimulált kvantum relációs gráfokig
 
@@ -12,9 +13,6 @@ A JAIDE lényege a Reversible Scatter Flow. Ez egy egyedülálló számítási p
 - Memóriahatékonyság: Mivel a hálózat reverzibilis, az aktiválásokat nem kell tárolni a backpropagációhoz. A backwardFromOutputs függvény soron belül rekonstruálja a bemeneteket a kimenetekből, így a memória komplexitása a mélységhez képest O(1) marad
 - Strukturális identitás: Az RSF architektúra konzisztens 4-tenzoros struktúrát (s_weight, t_weight, s_bias, t_bias) tart fenn a Zig, a Futhark és az olyan formális verifikációs nyelvek, mint a Lean 4 és a Mizar között
 
-### Magas szintű rendszerarchitektúra
-
-A következő ábra azt szemlélteti, hogy a természetes nyelvi bemenetek hogyan lépnek át a JAIDE alapvető kód-entitás terébe.
 
 ### Kulcsfontosságú alrendszerek
 
@@ -26,9 +24,7 @@ A JAIDE több különböző, de egymással összekapcsolt alrendszerre tagolódi
 4.   NSIR (kvantum-realizációs gráf): Egy önhasonló relációs gráf, amely a hierarchikus gondolkodáshoz a kvantumlogikát (Hadamard, CNOT kapuk) és a klasszikus aktiválást integrálja
 5.   Hardveres gyorsítás: Futharkot használó multi-backend rendszer a GPU-kernelekhez (CUDA/OpenCL) és Clash-t az RTL hardver szintézishez
 
-### Adatáramlás és komponensek kölcsönhatása
 
-Ez az ábra az elsődleges kódmodulok és az adatáramlás közötti kapcsolatot mutatja egy szabványos következtetési ciklus során.
 
 ### Kódbázis szervezése
 
@@ -54,11 +50,6 @@ Részletes műszaki dokumentációért kérjük, tekintse meg a következő alol
 
 ### "Nyitott adattár")
 
-Devin
-
-Utolsó indexálás: 2026. május 10. (
-
-Menü
 
 ### Kezdő lépések és rendszerépítés
 
