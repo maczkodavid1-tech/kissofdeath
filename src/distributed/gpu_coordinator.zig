@@ -2,122 +2,222 @@ const std = @import("std");
 const nccl = @import("nccl_bindings.zig");
 const Allocator = std.mem.Allocator;
 
-fn constOpaquePtrFrom(value: anytype) *const anyopaque {
+fn constOpaquePtrFrom(value: anytype) !*const anyopaque {
     const T = @TypeOf(value);
     return switch (@typeInfo(T)) {
         .pointer => |ptr_info| switch (ptr_info.size) {
-            .One, .Many, .C => @ptrCast(value),
+            .One => @ptrCast(value),
             .Slice => blk: {
-                std.debug.assert(value.len > 0);
+                if (value.len == 0) {
+                    return error.EmptyBuffer;
+                }
                 break :blk @ptrCast(&value[0]);
             },
+            .Many, .C => @compileError("constOpaquePtrFrom: expected single pointer or slice, got unbounded pointer type " ++ @typeName(T)),
         },
-        else => @compileError("expected pointer or slice"),
+        else => @compileError("constOpaquePtrFrom: expected pointer or slice, got " ++ @typeName(T)),
     };
 }
 
-fn opaquePtrFrom(value: anytype) *anyopaque {
+fn opaquePtrFrom(value: anytype) !*anyopaque {
     const T = @TypeOf(value);
     return switch (@typeInfo(T)) {
         .pointer => |ptr_info| switch (ptr_info.size) {
-            .One, .Many, .C => blk: {
+            .One => blk: {
                 if (ptr_info.is_const) {
-                    @compileError("expected mutable pointer");
+                    @compileError("opaquePtrFrom: expected mutable pointer, got " ++ @typeName(T));
                 }
                 break :blk @ptrCast(value);
             },
             .Slice => blk: {
                 if (ptr_info.is_const) {
-                    @compileError("expected mutable slice");
+                    @compileError("opaquePtrFrom: expected mutable slice, got " ++ @typeName(T));
                 }
-                std.debug.assert(value.len > 0);
+                if (value.len == 0) {
+                    return error.EmptyBuffer;
+                }
                 break :blk @ptrCast(&value[0]);
             },
+            .Many, .C => @compileError("opaquePtrFrom: expected single pointer or slice, got unbounded pointer type " ++ @typeName(T)),
         },
-        else => @compileError("expected pointer or slice"),
+        else => @compileError("opaquePtrFrom: expected pointer or slice, got " ++ @typeName(T)),
     };
 }
 
+fn checkCuda(err: nccl.CudaError, comptime tag: []const u8, fail_error: anyerror) !void {
+    if (err != .cudaSuccess) {
+        const err_str = nccl.cudaGetErrorString(err);
+        std.debug.print("CUDA error [{s}]: {s}\n", .{ tag, err_str });
+        return fail_error;
+    }
+}
+
+fn checkNccl(err: nccl.ncclResult_t, comptime tag: []const u8, fail_error: anyerror) !void {
+    if (err != .ncclSuccess) {
+        const err_str = nccl.ncclGetErrorString(err);
+        std.debug.print("NCCL error [{s}]: {s}\n", .{ tag, err_str });
+        return fail_error;
+    }
+}
+
+fn logCudaFailure(err: nccl.CudaError, comptime tag: []const u8) void {
+    if (err != .cudaSuccess) {
+        const err_str = nccl.cudaGetErrorString(err);
+        std.debug.print("CUDA cleanup error [{s}]: {s}\n", .{ tag, err_str });
+    }
+}
+
+fn logNcclFailure(err: nccl.ncclResult_t, comptime tag: []const u8) void {
+    if (err != .ncclSuccess) {
+        const err_str = nccl.ncclGetErrorString(err);
+        std.debug.print("NCCL cleanup error [{s}]: {s}\n", .{ tag, err_str });
+    }
+}
+
 pub const GPUCoordinator = struct {
-    allocator: Allocator,
     world_size: usize,
     rank: usize,
     device_id: i32,
-    nccl_comm: *nccl.ncclComm,
-    cuda_stream: *anyopaque,
+    nccl_comm: ?*nccl.ncclComm,
+    cuda_stream: ?*anyopaque,
+    barrier_buffer: ?*anyopaque,
 
     pub fn init(allocator: Allocator, world_size: usize, rank: usize, nccl_id: nccl.ncclUniqueId) !GPUCoordinator {
+        _ = allocator;
+
         if (world_size == 0) {
             return error.InvalidWorldSize;
         }
         if (rank >= world_size) {
             return error.InvalidRank;
         }
+        if (world_size > @as(usize, @intCast(std.math.maxInt(c_int)))) {
+            return error.WorldSizeTooLarge;
+        }
+        if (rank > @as(usize, @intCast(std.math.maxInt(c_int)))) {
+            return error.RankTooLarge;
+        }
 
         var device_count: c_int = 0;
-        var cuda_err = nccl.cudaGetDeviceCount(&device_count);
-        if (cuda_err != .cudaSuccess) {
-            return error.CudaGetDeviceCountFailed;
-        }
+        try checkCuda(nccl.cudaGetDeviceCount(&device_count), "cudaGetDeviceCount", error.CudaGetDeviceCountFailed);
         if (device_count <= 0) {
             return error.InsufficientGPUs;
         }
 
         const local_device_count: usize = @intCast(device_count);
-        const device_id: i32 = @intCast(rank % local_device_count);
-        cuda_err = nccl.cudaSetDevice(device_id);
-        if (cuda_err != .cudaSuccess) {
-            return error.CudaSetDeviceFailed;
+        const device_id_usize: usize = rank % local_device_count;
+        if (device_id_usize > @as(usize, @intCast(std.math.maxInt(i32)))) {
+            return error.DeviceIdOutOfRange;
         }
+        const device_id: i32 = @intCast(device_id_usize);
 
-        var nccl_comm: *nccl.ncclComm = undefined;
-        const nccl_err = nccl.ncclCommInitRank(&nccl_comm, @intCast(world_size), nccl_id, @intCast(rank));
-        if (nccl_err != .ncclSuccess) {
-            const err_str = nccl.ncclGetErrorString(nccl_err);
-            std.debug.print("NCCL Error: {s}\n", .{err_str});
-            return error.NCCLCommInitFailed;
-        }
-        errdefer _ = nccl.ncclCommDestroy(nccl_comm);
+        try checkCuda(nccl.cudaSetDevice(device_id), "cudaSetDevice", error.CudaSetDeviceFailed);
 
-        var cuda_stream: *anyopaque = undefined;
-        cuda_err = nccl.cudaStreamCreate(&cuda_stream);
-        if (cuda_err != .cudaSuccess) {
-            return error.CudaStreamCreateFailed;
-        }
+        var nccl_comm_local: *nccl.ncclComm = undefined;
+        try checkNccl(
+            nccl.ncclCommInitRank(&nccl_comm_local, @intCast(world_size), nccl_id, @intCast(rank)),
+            "ncclCommInitRank",
+            error.NCCLCommInitFailed,
+        );
+        errdefer logNcclFailure(nccl.ncclCommDestroy(nccl_comm_local), "ncclCommDestroy(init rollback)");
+
+        var cuda_stream_local: *anyopaque = undefined;
+        try checkCuda(nccl.cudaStreamCreate(&cuda_stream_local), "cudaStreamCreate", error.CudaStreamCreateFailed);
+        errdefer logCudaFailure(nccl.cudaStreamDestroy(cuda_stream_local), "cudaStreamDestroy(init rollback)");
+
+        var barrier_buf_local: ?*anyopaque = null;
+        try checkCuda(nccl.cudaMalloc(&barrier_buf_local, @sizeOf(f32)), "cudaMalloc(barrier)", error.CudaMallocFailed);
+        const barrier_buffer = barrier_buf_local orelse return error.CudaMallocFailed;
+        errdefer logCudaFailure(nccl.cudaFree(barrier_buffer), "cudaFree(barrier init rollback)");
+
+        try checkCuda(nccl.cudaMemset(barrier_buffer, 0, @sizeOf(f32)), "cudaMemset(barrier)", error.CudaMemsetFailed);
+        try checkCuda(nccl.cudaDeviceSynchronize(), "cudaDeviceSynchronize(barrier init)", error.CudaSynchronizeFailed);
 
         return GPUCoordinator{
-            .allocator = allocator,
             .world_size = world_size,
             .rank = rank,
             .device_id = device_id,
-            .nccl_comm = nccl_comm,
-            .cuda_stream = cuda_stream,
+            .nccl_comm = nccl_comm_local,
+            .cuda_stream = cuda_stream_local,
+            .barrier_buffer = barrier_buffer,
         };
     }
 
     pub fn deinit(self: *GPUCoordinator) void {
-        _ = nccl.cudaStreamSynchronize(self.cuda_stream);
-        _ = nccl.cudaStreamDestroy(self.cuda_stream);
-        _ = nccl.ncclCommDestroy(self.nccl_comm);
+        logCudaFailure(nccl.cudaSetDevice(self.device_id), "cudaSetDevice(deinit)");
+
+        if (self.cuda_stream) |stream| {
+            logCudaFailure(nccl.cudaStreamSynchronize(stream), "cudaStreamSynchronize(deinit)");
+        }
+
+        if (self.barrier_buffer) |buffer| {
+            logCudaFailure(nccl.cudaFree(buffer), "cudaFree(barrier)");
+            self.barrier_buffer = null;
+        }
+
+        if (self.nccl_comm) |comm| {
+            if (@hasDecl(nccl, "ncclCommFinalize")) {
+                logNcclFailure(nccl.ncclCommFinalize(comm), "ncclCommFinalize");
+            }
+            logNcclFailure(nccl.ncclCommDestroy(comm), "ncclCommDestroy");
+            self.nccl_comm = null;
+        }
+
+        if (self.cuda_stream) |stream| {
+            logCudaFailure(nccl.cudaStreamDestroy(stream), "cudaStreamDestroy");
+            self.cuda_stream = null;
+        }
+    }
+
+    fn setDevice(self: *GPUCoordinator) !void {
+        try checkCuda(nccl.cudaSetDevice(self.device_id), "cudaSetDevice", error.CudaSetDeviceFailed);
+    }
+
+    fn requireComm(self: *GPUCoordinator) !*nccl.ncclComm {
+        return self.nccl_comm orelse return error.CoordinatorNotInitialized;
+    }
+
+    fn requireStream(self: *GPUCoordinator) !*anyopaque {
+        return self.cuda_stream orelse return error.CoordinatorNotInitialized;
     }
 
     pub fn allocDeviceMemory(self: *GPUCoordinator, size: usize) !*anyopaque {
-        _ = self;
         if (size == 0) {
             return error.InvalidAllocationSize;
         }
 
+        try self.setDevice();
+
         var dev_ptr: ?*anyopaque = null;
-        const err = nccl.cudaMalloc(&dev_ptr, size);
-        if (err != .cudaSuccess) {
-            return error.CudaMallocFailed;
-        }
+        try checkCuda(nccl.cudaMalloc(&dev_ptr, size), "cudaMalloc", error.CudaMallocFailed);
         return dev_ptr orelse return error.CudaMallocFailed;
     }
 
-    pub fn freeDeviceMemory(self: *GPUCoordinator, ptr: *anyopaque) void {
-        _ = self;
-        _ = nccl.cudaFree(ptr);
+    pub fn freeDeviceMemory(self: *GPUCoordinator, ptr: ?*anyopaque) void {
+        self.setDevice() catch |err| {
+            std.debug.print("CUDA cleanup error [cudaSetDevice(freeDeviceMemory)]: {}\n", .{err});
+            return;
+        };
+        if (ptr) |p| {
+            logCudaFailure(nccl.cudaFree(p), "cudaFree");
+        }
+    }
+
+    fn doMemcpy(
+        self: *GPUCoordinator,
+        dst_ptr: *anyopaque,
+        src_ptr: *const anyopaque,
+        size: usize,
+        kind: c_int,
+        comptime tag: []const u8,
+    ) !void {
+        if (size == 0) {
+            return;
+        }
+
+        _ = try self.requireStream();
+        try self.setDevice();
+        try checkCuda(nccl.cudaMemcpy(dst_ptr, src_ptr, size, kind), tag, error.CudaMemcpyFailed);
     }
 
     pub fn copyHostToDevice(self: *GPUCoordinator, dst: anytype, src: anytype, size: usize) !void {
@@ -125,15 +225,9 @@ pub const GPUCoordinator = struct {
             return;
         }
 
-        const dst_ptr = opaquePtrFrom(dst);
-        const src_ptr = constOpaquePtrFrom(src);
-        const err = if (@hasDecl(nccl, "cudaMemcpyAsync"))
-            nccl.cudaMemcpyAsync(dst_ptr, src_ptr, size, nccl.cudaMemcpyKind.cudaMemcpyHostToDevice, self.cuda_stream)
-        else
-            nccl.cudaMemcpy(dst_ptr, src_ptr, size, nccl.cudaMemcpyKind.cudaMemcpyHostToDevice);
-        if (err != .cudaSuccess) {
-            return error.CudaMemcpyFailed;
-        }
+        const dst_ptr = try opaquePtrFrom(dst);
+        const src_ptr = try constOpaquePtrFrom(src);
+        try self.doMemcpy(dst_ptr, src_ptr, size, nccl.cudaMemcpyKind.cudaMemcpyHostToDevice, "cudaMemcpyHostToDevice");
     }
 
     pub fn copyDeviceToHost(self: *GPUCoordinator, dst: anytype, src: anytype, size: usize) !void {
@@ -141,85 +235,174 @@ pub const GPUCoordinator = struct {
             return;
         }
 
-        const dst_ptr = opaquePtrFrom(dst);
-        const src_ptr = constOpaquePtrFrom(src);
-        const err = if (@hasDecl(nccl, "cudaMemcpyAsync"))
-            nccl.cudaMemcpyAsync(dst_ptr, src_ptr, size, nccl.cudaMemcpyKind.cudaMemcpyDeviceToHost, self.cuda_stream)
-        else
-            nccl.cudaMemcpy(dst_ptr, src_ptr, size, nccl.cudaMemcpyKind.cudaMemcpyDeviceToHost);
-        if (err != .cudaSuccess) {
-            return error.CudaMemcpyFailed;
+        const dst_ptr = try opaquePtrFrom(dst);
+        const src_ptr = try constOpaquePtrFrom(src);
+        try self.doMemcpy(dst_ptr, src_ptr, size, nccl.cudaMemcpyKind.cudaMemcpyDeviceToHost, "cudaMemcpyDeviceToHost");
+    }
+
+    pub fn copyDeviceToDevice(self: *GPUCoordinator, dst: anytype, src: anytype, size: usize) !void {
+        if (size == 0) {
+            return;
         }
+
+        const dst_ptr = try opaquePtrFrom(dst);
+        const src_ptr = try constOpaquePtrFrom(src);
+        try self.doMemcpy(dst_ptr, src_ptr, size, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice, "cudaMemcpyDeviceToDevice");
+    }
+
+    fn doAllReduce(
+        self: *GPUCoordinator,
+        send_buf: *const anyopaque,
+        recv_buf: *anyopaque,
+        count: usize,
+        dtype: nccl.ncclDataType_t,
+        op: nccl.ncclRedOp_t,
+        comptime tag: []const u8,
+    ) !void {
+        if (count == 0) {
+            return;
+        }
+
+        const comm = try self.requireComm();
+        const stream = try self.requireStream();
+        try self.setDevice();
+
+        try checkNccl(
+            nccl.ncclAllReduce(send_buf, recv_buf, count, dtype, op, comm, stream),
+            tag,
+            error.NCCLAllReduceFailed,
+        );
     }
 
     pub fn allReduceFloat32(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
-        const err = nccl.ncclAllReduce(
-            send_buf,
-            recv_buf,
-            count,
-            .ncclFloat32,
-            .ncclSum,
-            self.nccl_comm,
-            self.cuda_stream,
-        );
-        if (err != .ncclSuccess) {
-            const err_str = nccl.ncclGetErrorString(err);
-            std.debug.print("NCCL AllReduce Error: {s}\n", .{err_str});
-            return error.NCCLAllReduceFailed;
-        }
+        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclSum, "ncclAllReduceFloat32Sum");
     }
 
     pub fn allReduceFloat16(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
-        const err = nccl.ncclAllReduce(
-            send_buf,
-            recv_buf,
-            count,
-            .ncclFloat16,
-            .ncclSum,
-            self.nccl_comm,
-            self.cuda_stream,
-        );
-        if (err != .ncclSuccess) {
-            const err_str = nccl.ncclGetErrorString(err);
-            std.debug.print("NCCL AllReduce (f16) Error: {s}\n", .{err_str});
-            return error.NCCLAllReduceFailed;
-        }
+        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat16, .ncclSum, "ncclAllReduceFloat16Sum");
     }
 
-    pub fn broadcastFloat32(self: *GPUCoordinator, buf: *anyopaque, count: usize, root: usize) !void {
+    pub fn allReduceFloat32Max(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
+        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclMax, "ncclAllReduceFloat32Max");
+    }
+
+    pub fn allReduceFloat32Min(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
+        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclMin, "ncclAllReduceFloat32Min");
+    }
+
+    fn doBroadcast(
+        self: *GPUCoordinator,
+        send_buf: *const anyopaque,
+        recv_buf: *anyopaque,
+        count: usize,
+        dtype: nccl.ncclDataType_t,
+        root: usize,
+        comptime tag: []const u8,
+    ) !void {
+        if (count == 0) {
+            return;
+        }
         if (root >= self.world_size) {
             return error.InvalidRootRank;
         }
-
-        const err = nccl.ncclBroadcast(
-            buf,
-            buf,
-            count,
-            .ncclFloat32,
-            @intCast(root),
-            self.nccl_comm,
-            self.cuda_stream,
-        );
-        if (err != .ncclSuccess) {
-            return error.NCCLBroadcastFailed;
+        if (root > @as(usize, @intCast(std.math.maxInt(c_int)))) {
+            return error.InvalidRootRank;
         }
+
+        const comm = try self.requireComm();
+        const stream = try self.requireStream();
+        try self.setDevice();
+
+        try checkNccl(
+            nccl.ncclBroadcast(send_buf, recv_buf, count, dtype, @intCast(root), comm, stream),
+            tag,
+            error.NCCLBroadcastFailed,
+        );
+    }
+
+    pub fn broadcastFloat32(self: *GPUCoordinator, buf: *anyopaque, count: usize, root: usize) !void {
+        try self.doBroadcast(buf, buf, count, .ncclFloat32, root, "ncclBroadcastFloat32");
+    }
+
+    pub fn broadcastFloat16(self: *GPUCoordinator, buf: *anyopaque, count: usize, root: usize) !void {
+        try self.doBroadcast(buf, buf, count, .ncclFloat16, root, "ncclBroadcastFloat16");
+    }
+
+    pub fn allGatherFloat32(
+        self: *GPUCoordinator,
+        send_buf: *const anyopaque,
+        recv_buf: *anyopaque,
+        send_count: usize,
+    ) !void {
+        if (send_count == 0) {
+            return;
+        }
+
+        const comm = try self.requireComm();
+        const stream = try self.requireStream();
+        try self.setDevice();
+
+        try checkNccl(
+            nccl.ncclAllGather(send_buf, recv_buf, send_count, .ncclFloat32, comm, stream),
+            "ncclAllGatherFloat32",
+            error.NCCLAllGatherFailed,
+        );
+    }
+
+    pub fn reduceScatterFloat32(
+        self: *GPUCoordinator,
+        send_buf: *const anyopaque,
+        recv_buf: *anyopaque,
+        recv_count: usize,
+    ) !void {
+        if (recv_count == 0) {
+            return;
+        }
+
+        const comm = try self.requireComm();
+        const stream = try self.requireStream();
+        try self.setDevice();
+
+        try checkNccl(
+            nccl.ncclReduceScatter(send_buf, recv_buf, recv_count, .ncclFloat32, .ncclSum, comm, stream),
+            "ncclReduceScatterFloat32Sum",
+            error.NCCLReduceScatterFailed,
+        );
     }
 
     pub fn synchronize(self: *GPUCoordinator) !void {
-        const err = nccl.cudaStreamSynchronize(self.cuda_stream);
-        if (err != .cudaSuccess) {
-            return error.CudaSynchronizeFailed;
+        const stream = try self.requireStream();
+        try self.setDevice();
+
+        try checkCuda(nccl.cudaStreamSynchronize(stream), "cudaStreamSynchronize", error.CudaSynchronizeFailed);
+
+        if (@hasDecl(nccl, "cudaGetLastError")) {
+            try checkCuda(nccl.cudaGetLastError(), "cudaGetLastError", error.CudaSynchronizeFailed);
+        }
+    }
+
+    pub fn deviceSynchronize(self: *GPUCoordinator) !void {
+        try self.setDevice();
+        try checkCuda(nccl.cudaDeviceSynchronize(), "cudaDeviceSynchronize", error.CudaSynchronizeFailed);
+
+        if (@hasDecl(nccl, "cudaGetLastError")) {
+            try checkCuda(nccl.cudaGetLastError(), "cudaGetLastError(device)", error.CudaSynchronizeFailed);
         }
     }
 
     pub fn barrier(self: *GPUCoordinator) !void {
-        var sync_value: f32 = 0.0;
-        const sync_buffer = try self.allocDeviceMemory(@sizeOf(f32));
-        defer self.freeDeviceMemory(sync_buffer);
+        const buf = self.barrier_buffer orelse return error.CoordinatorNotInitialized;
+        const comm = try self.requireComm();
+        const stream = try self.requireStream();
 
-        try self.copyHostToDevice(sync_buffer, &sync_value, @sizeOf(f32));
-        try self.allReduceFloat32(sync_buffer, sync_buffer, 1);
-        try self.synchronize();
+        try self.setDevice();
+
+        try checkNccl(
+            nccl.ncclAllReduce(buf, buf, 1, .ncclFloat32, .ncclSum, comm, stream),
+            "ncclAllReduceBarrier",
+            error.NCCLAllReduceFailed,
+        );
+        try checkCuda(nccl.cudaStreamSynchronize(stream), "cudaStreamSynchronize(barrier)", error.CudaSynchronizeFailed);
     }
 
     pub fn isRoot(self: *const GPUCoordinator) bool {
