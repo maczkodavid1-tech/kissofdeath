@@ -1,3 +1,5 @@
+Update: The formal verification of rsf.zig is complete and can be found at: src/verification/lean4/rsf.lean
+
 ## JAIDE áttekintés
 
 A JAIDE (v40) egy kvantum-klasszikus hibrid nagy nyelvi modell, amely az alapoktól kezdve a Reversible Scatter Flow (RSF) paradigma megvalósítására épült.
