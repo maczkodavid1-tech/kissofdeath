@@ -22,8 +22,10 @@ pub const RSFConfig = struct {
 
 const SAVE_VERSION: u32 = 4;
 
+var scratch_gpa_backing = std.heap.GeneralPurposeAllocator(.{}){};
+
 fn scratchAllocator() Allocator {
-    return std.heap.page_allocator;
+    return scratch_gpa_backing.allocator();
 }
 
 fn checkedMul(a: usize, b: usize) !usize {
@@ -101,30 +103,6 @@ fn sameTensorStorage(a: *const Tensor, b: *const Tensor) bool {
     return @intFromPtr(a.data.ptr) == @intFromPtr(b.data.ptr);
 }
 
-fn allocTensorArray(allocator: Allocator, count: usize, rows: usize, cols: usize) ![]Tensor {
-    var arr = try allocator.alloc(Tensor, count);
-    errdefer allocator.free(arr);
-
-    var initialized: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < initialized) : (i += 1) arr[i].deinit();
-    }
-
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        arr[i] = try Tensor.init(allocator, &.{ rows, cols });
-        initialized += 1;
-    }
-
-    return arr;
-}
-
-fn freeTensorArray(allocator: Allocator, arr: []Tensor) void {
-    for (arr) |*t| t.deinit();
-    allocator.free(arr);
-}
-
 fn tensorClone(allocator: Allocator, src: *const Tensor) !Tensor {
     try validateTensor2D(src);
     var dst = try Tensor.init(allocator, &.{ src.shape.dims[0], src.shape.dims[1] });
@@ -138,7 +116,6 @@ fn tensorAllCloseEq(a: *const Tensor, b: *const Tensor, abs_tol: f32, rel_tol: f
     try validateTensor2D(a);
     try validateTensor2D(b);
     if (!tensorsSameShape(a, b)) return false;
-    if (a.data.len != b.data.len) return false;
     var i: usize = 0;
     while (i < a.data.len) : (i += 1) {
         const av = a.data[i];
@@ -166,7 +143,6 @@ fn copyTensorPairInto(out1: *Tensor, out2: *Tensor, in1: *const Tensor, in2: *co
     try validateTensor2D(in2);
 
     if (!tensorsSameShape(out1, in1) or !tensorsSameShape(out2, in2)) return error.ShapeMismatch;
-    if (out1.data.len != in1.data.len or out2.data.len != in2.data.len) return error.DataLengthMismatch;
     if (tensorsOverlap(out1, out2)) return error.AliasedBuffers;
 
     const need_temp =
@@ -528,156 +504,6 @@ const LayerCore = struct {
             }
         }
     }
-
-    fn backwardFromOutputs(
-        self: *LayerCore,
-        y1: *const Tensor,
-        y2: *const Tensor,
-        dy1_in: *const Tensor,
-        dy2_in: *const Tensor,
-        x1_out: *Tensor,
-        x2_out: *Tensor,
-        dx1_out: *Tensor,
-        dx2_out: *Tensor,
-        dy1_total: []f32,
-        ds: []f32,
-    ) !void {
-        const batch_size = try self.validateBackwardIO(y1, y2, dy1_in, dy2_in);
-        try validateTensor2D(x1_out);
-        try validateTensor2D(x2_out);
-        try validateTensor2D(dx1_out);
-        try validateTensor2D(dx2_out);
-
-        if (x1_out.shape.dims[0] != batch_size or x2_out.shape.dims[0] != batch_size or dx1_out.shape.dims[0] != batch_size or dx2_out.shape.dims[0] != batch_size) return error.ShapeMismatch;
-        if (x1_out.shape.dims[1] != self.dim or x2_out.shape.dims[1] != self.dim or dx1_out.shape.dims[1] != self.dim or dx2_out.shape.dims[1] != self.dim) return error.ShapeMismatch;
-
-        const bd = try checkedMul(batch_size, self.dim);
-        if (dy1_total.len != bd or ds.len != bd) return error.DataLengthMismatch;
-
-        try self.ensureGradients();
-
-        const dim = self.dim;
-        const grad_scale = self.gradScale(batch_size);
-
-        var b: usize = 0;
-        while (b < batch_size) : (b += 1) {
-            const y1_row = y1.data[b * dim .. b * dim + dim];
-            const dy1_row = dy1_in.data[b * dim .. b * dim + dim];
-            const dy2_row = dy2_in.data[b * dim .. b * dim + dim];
-            const dy1_total_row = dy1_total[b * dim .. b * dim + dim];
-
-            @memcpy(dy1_total_row, dy1_row);
-            var d: usize = 0;
-            while (d < dim) : (d += 1) {
-                const dy2_val = dy2_row[d];
-                const t_row = self.t_weight.data[d * dim .. d * dim + dim];
-                var j: usize = 0;
-                while (j < dim) : (j += 1) dy1_total_row[j] += t_row[j] * dy2_val;
-            }
-
-            if (self.t_weight_grad) |*twg| {
-                d = 0;
-                while (d < dim) : (d += 1) {
-                    const dyv = dy2_row[d] * grad_scale;
-                    var j2: usize = 0;
-                    while (j2 < dim) : (j2 += 1) twg.data[d * dim + j2] += dyv * y1_row[j2];
-                }
-            }
-
-            if (self.t_bias_grad) |*tbg| {
-                d = 0;
-                while (d < dim) : (d += 1) tbg.data[d] += dy2_row[d] * grad_scale;
-            }
-        }
-
-        b = 0;
-        while (b < batch_size) : (b += 1) {
-            const y1_row = y1.data[b * dim .. b * dim + dim];
-            const y2_row = y2.data[b * dim .. b * dim + dim];
-            const x2_row = x2_out.data[b * dim .. b * dim + dim];
-            const x1_row = x1_out.data[b * dim .. b * dim + dim];
-            const dx1_row = dx1_out.data[b * dim .. b * dim + dim];
-            const ds_row = ds[b * dim .. b * dim + dim];
-            const dy1_total_row = dy1_total[b * dim .. b * dim + dim];
-
-            var d: usize = 0;
-            while (d < dim) : (d += 1) {
-                var trans_sum: f32 = self.t_bias.data[d];
-                const t_row = self.t_weight.data[d * dim .. d * dim + dim];
-                var j: usize = 0;
-                while (j < dim) : (j += 1) trans_sum += t_row[j] * y1_row[j];
-                x2_row[d] = y2_row[d] - trans_sum;
-            }
-
-            var d2: usize = 0;
-            while (d2 < dim) : (d2 += 1) {
-                var pre_sum: f32 = self.s_bias.data[d2];
-                const s_row = self.s_weight.data[d2 * dim .. d2 * dim + dim];
-                var j2: usize = 0;
-                while (j2 < dim) : (j2 += 1) pre_sum += s_row[j2] * x2_row[j2];
-
-                const clipped = if (pre_sum < self.clip_min) self.clip_min else if (pre_sum > self.clip_max) self.clip_max else pre_sum;
-                const scale = @exp(clipped);
-
-                x1_row[d2] = y1_row[d2] / scale;
-                dx1_row[d2] = dy1_total_row[d2] * scale;
-                ds_row[d2] = if (pre_sum < self.clip_min or pre_sum > self.clip_max) 0.0 else dy1_total_row[d2] * y1_row[d2];
-            }
-
-            if (self.s_weight_grad) |*swg| {
-                var d3: usize = 0;
-                while (d3 < dim) : (d3 += 1) {
-                    const dsv = ds_row[d3] * grad_scale;
-                    var j3: usize = 0;
-                    while (j3 < dim) : (j3 += 1) swg.data[d3 * dim + j3] += dsv * x2_row[j3];
-                }
-            }
-
-            if (self.s_bias_grad) |*sbg| {
-                var d4: usize = 0;
-                while (d4 < dim) : (d4 += 1) sbg.data[d4] += ds_row[d4] * grad_scale;
-            }
-
-            const dx2_row = dx2_out.data[b * dim .. b * dim + dim];
-            const dy2_row = dy2_in.data[b * dim .. b * dim + dim];
-            @memcpy(dx2_row, dy2_row);
-            var d5: usize = 0;
-            while (d5 < dim) : (d5 += 1) {
-                const ds_val = ds_row[d5];
-                const s_row = self.s_weight.data[d5 * dim .. d5 * dim + dim];
-                var j4: usize = 0;
-                while (j4 < dim) : (j4 += 1) dx2_row[j4] += s_row[j4] * ds_val;
-            }
-        }
-    }
-
-    fn forwardChecked(self: *const LayerCore, x1: *const Tensor, x2: *const Tensor, out1: *Tensor, out2: *Tensor) !void {
-        try validateTensor2D(x1);
-        try validateTensor2D(x2);
-        try validateTensor2D(out1);
-        try validateTensor2D(out2);
-
-        if (x1.shape.dims[0] != x2.shape.dims[0] or x1.shape.dims[1] != self.dim or x2.shape.dims[1] != self.dim) return error.ShapeMismatch;
-        if (out1.shape.dims[0] != x1.shape.dims[0] or out2.shape.dims[0] != x1.shape.dims[0]) return error.ShapeMismatch;
-        if (out1.shape.dims[1] != self.dim or out2.shape.dims[1] != self.dim) return error.ShapeMismatch;
-
-        try copyTensorPairInto(out1, out2, x1, x2);
-        try self.forwardInPlace(out1, out2);
-    }
-
-    fn inverseChecked(self: *const LayerCore, y1: *const Tensor, y2: *const Tensor, out1: *Tensor, out2: *Tensor) !void {
-        try validateTensor2D(y1);
-        try validateTensor2D(y2);
-        try validateTensor2D(out1);
-        try validateTensor2D(out2);
-
-        if (y1.shape.dims[0] != y2.shape.dims[0] or y1.shape.dims[1] != self.dim or y2.shape.dims[1] != self.dim) return error.ShapeMismatch;
-        if (out1.shape.dims[0] != y1.shape.dims[0] or out2.shape.dims[0] != y1.shape.dims[0]) return error.ShapeMismatch;
-        if (out1.shape.dims[1] != self.dim or out2.shape.dims[1] != self.dim) return error.ShapeMismatch;
-
-        try copyTensorPairInto(out1, out2, y1, y2);
-        try self.inverseInPlace(out1, out2);
-    }
 };
 
 const LayerRegistryEntry = struct {
@@ -920,6 +746,13 @@ fn bindLayerHandle(self: *const RSFLayer) !u64 {
     return id;
 }
 
+fn maybeShrinkHandleMap(map: *std.AutoHashMap(u64, usize)) void {
+    if (map.count() == 0) {
+        map.deinit();
+        map.* = std.AutoHashMap(u64, usize).init(std.heap.page_allocator);
+    }
+}
+
 fn shouldDestroyLayerHandle(self: *RSFLayer) bool {
     const id = self.id;
     if (id == 0) return false;
@@ -929,6 +762,7 @@ fn shouldDestroyLayerHandle(self: *RSFLayer) bool {
     if (g_layer_handle_owner.get(id)) |owner_addr| {
         if (owner_addr == self_addr) {
             _ = g_layer_handle_owner.remove(id);
+            maybeShrinkHandleMap(&g_layer_handle_owner);
             return true;
         }
         return false;
@@ -1332,10 +1166,12 @@ fn syncAllLayersGPU(core: *RSFCore) !void {
 
     try staged_accel.setClipRange(@floatCast(core.cfg.clip_min), @floatCast(core.cfg.clip_max));
 
-    if (core.layers.len == 1) {
+    {
         const bias_f16 = try core.allocator.alloc(f16, core.dim);
         defer core.allocator.free(bias_f16);
-        try uploadLayerToAccel(core, &core.layers[0], &staged_accel, local_f16, bias_f16);
+        for (core.layers) |*layer| {
+            try uploadLayerToAccel(core, layer, &staged_accel, local_f16, bias_f16);
+        }
     }
 
     if (core.gpu_accel) |*ga| ga.deinit();
@@ -1348,10 +1184,6 @@ fn syncAllLayersGPU(core: *RSFCore) !void {
     core.gpu_weight_version = core.cpu_weight_version;
     core.gpu_available.store(1, .monotonic);
     success = true;
-}
-
-fn invalidateGPUForMismatch(core: *RSFCore) void {
-    disableGPU(core);
 }
 
 fn tryForwardGPU(core: *RSFCore, x: *Tensor) !bool {
@@ -1371,41 +1203,41 @@ fn tryForwardGPU(core: *RSFCore, x: *Tensor) !bool {
                 var gpu_result = result;
                 if (!tensorHasShape(&gpu_result, x.shape.dims[0], x.shape.dims[1]) or gpu_result.data.len != x.data.len) {
                     gpu_result.deinit();
-                    invalidateGPUForMismatch(core);
+                    disableGPU(core);
                     return false;
                 }
                 x.deinit();
                 x.* = gpu_result;
                 return true;
             } else |_| {
-                invalidateGPUForMismatch(core);
+                disableGPU(core);
                 return false;
             }
         }
 
         if (core.f16_buf == null) {
-            invalidateGPUForMismatch(core);
+            disableGPU(core);
             return false;
         }
         const f16_buf = core.f16_buf.?;
         const dim_sq = checkedMul(core.dim, core.dim) catch {
-            invalidateGPUForMismatch(core);
+            disableGPU(core);
             return false;
         };
         if (f16_buf.len < dim_sq) {
-            invalidateGPUForMismatch(core);
+            disableGPU(core);
             return false;
         }
 
         const bias_f16 = core.allocator.alloc(f16, core.dim) catch {
-            invalidateGPUForMismatch(core);
+            disableGPU(core);
             return false;
         };
         defer core.allocator.free(bias_f16);
 
         for (core.layers) |*layer| {
             uploadLayerToAccel(core, layer, ga, f16_buf, bias_f16) catch {
-                invalidateGPUForMismatch(core);
+                disableGPU(core);
                 return false;
             };
 
@@ -1413,13 +1245,13 @@ fn tryForwardGPU(core: *RSFCore, x: *Tensor) !bool {
                 var gpu_result = result;
                 if (!tensorHasShape(&gpu_result, x.shape.dims[0], x.shape.dims[1]) or gpu_result.data.len != x.data.len) {
                     gpu_result.deinit();
-                    invalidateGPUForMismatch(core);
+                    disableGPU(core);
                     return false;
                 }
                 x.deinit();
                 x.* = gpu_result;
             } else |_| {
-                invalidateGPUForMismatch(core);
+                disableGPU(core);
                 return false;
             }
         }
@@ -1485,14 +1317,22 @@ fn snapshotModelForSave(allocator: Allocator, core: *const RSFCore) !SavedModelS
         try ensureFiniteSlice(layer.s_bias.data);
         try ensureFiniteSlice(layer.t_bias.data);
 
+        var sw = try tensorClone(allocator, &layer.s_weight);
+        errdefer sw.deinit();
+        var tw = try tensorClone(allocator, &layer.t_weight);
+        errdefer tw.deinit();
+        var sb = try tensorClone(allocator, &layer.s_bias);
+        errdefer sb.deinit();
+        const tb = try tensorClone(allocator, &layer.t_bias);
+
         layers[i] = .{
             .clip_min = layer.clip_min,
             .clip_max = layer.clip_max,
             .grad_mean = layer.grad_mean,
-            .s_weight = try tensorClone(allocator, &layer.s_weight),
-            .t_weight = try tensorClone(allocator, &layer.t_weight),
-            .s_bias = try tensorClone(allocator, &layer.s_bias),
-            .t_bias = try tensorClone(allocator, &layer.t_bias),
+            .s_weight = sw,
+            .t_weight = tw,
+            .s_bias = sb,
+            .t_bias = tb,
         };
         initialized += 1;
     }
@@ -1635,20 +1475,31 @@ pub const RSF = struct {
         if (x.shape.dims[0] == 0) return error.InvalidBatchSize;
 
         if (comptime accel.gpu_enabled) {
-            const needs_write = modelGPUCompatible(core) or core.gpu_available.load(.monotonic) != 0 or core.gpu_accel != null or core.f16_buf != null or core.gpu_weight_version != 0;
+            const needs_write = core.gpu_available.load(.monotonic) != 0 or modelGPUCompatible(core);
             if (needs_write) {
-                core.rwlock.lock();
-                defer core.rwlock.unlock();
+                var gpu_succeeded = false;
+                {
+                    core.rwlock.lock();
+                    defer core.rwlock.unlock();
 
-                if (modelGPUCompatible(core)) {
-                    if (try tryForwardGPU(core, x)) return;
-                    syncAllLayersGPU(core) catch {};
-                    if (try tryForwardGPU(core, x)) return;
-                } else if (core.gpu_available.load(.monotonic) != 0 or core.gpu_accel != null or core.f16_buf != null or core.gpu_weight_version != 0) {
-                    disableGPU(core);
+                    if (modelGPUCompatible(core)) {
+                        if (try tryForwardGPU(core, x)) {
+                            gpu_succeeded = true;
+                        } else {
+                            syncAllLayersGPU(core) catch {};
+                            if (try tryForwardGPU(core, x)) {
+                                gpu_succeeded = true;
+                            }
+                        }
+                    } else if (core.gpu_available.load(.monotonic) != 0 or core.gpu_accel != null or core.f16_buf != null or core.gpu_weight_version != 0) {
+                        disableGPU(core);
+                    }
                 }
-
-                try forwardOnCore(core, x);
+                if (!gpu_succeeded) {
+                    core.rwlock.lockShared();
+                    defer core.rwlock.unlockShared();
+                    try forwardOnCore(core, x);
+                }
             } else {
                 core.rwlock.lockShared();
                 defer core.rwlock.unlockShared();
@@ -1677,6 +1528,16 @@ pub const RSF = struct {
         core.rwlock.lock();
         defer core.rwlock.unlock();
         try backwardOnCore(core, grad_output, input, grad_input_out);
+        core.cpu_weight_version +%= 1;
+    }
+
+    pub fn notifyWeightsChanged(self: *RSF) !void {
+        const id = try bindModelHandle(self);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lock();
+        defer core.rwlock.unlock();
+        core.cpu_weight_version +%= 1;
     }
 
     pub fn verifyInvertible(self: *RSF, x: *const Tensor, abs_tol: f32, rel_tol: f32) !bool {
@@ -1880,8 +1741,6 @@ pub const RSF = struct {
 
         if (modelGPUCompatible(core)) {
             syncAllLayersGPU(core) catch disableGPU(core);
-        } else {
-            disableGPU(core);
         }
 
         const id = try registerModelCore(core);
@@ -1953,6 +1812,7 @@ fn shouldDestroyModelHandle(self: *RSF) bool {
     if (g_model_handle_owner.get(id)) |owner_addr| {
         if (owner_addr == self_addr) {
             _ = g_model_handle_owner.remove(id);
+            maybeShrinkHandleMap(&g_model_handle_owner);
             return true;
         }
         return false;
@@ -2108,17 +1968,7 @@ fn writeSnapshotVersion4ToPath(snapshot: *const SavedModelSnapshot, path: []cons
     var i: usize = 0;
     while (i < snapshot.layers.len) : (i += 1) {
         const layer = &snapshot.layers[i];
-        try validateClipRange(layer.clip_min, layer.clip_max);
         if (layer.clip_min != snapshot.cfg.clip_min or layer.clip_max != snapshot.cfg.clip_max or layer.grad_mean != snapshot.cfg.grad_mean) return error.InvalidConfig;
-
-        try validateTensor2DShape(&layer.s_weight, snapshot.dim, snapshot.dim);
-        try validateTensor2DShape(&layer.t_weight, snapshot.dim, snapshot.dim);
-        try validateTensor2DShape(&layer.s_bias, 1, snapshot.dim);
-        try validateTensor2DShape(&layer.t_bias, 1, snapshot.dim);
-        try ensureFiniteSlice(layer.s_weight.data);
-        try ensureFiniteSlice(layer.t_weight.data);
-        try ensureFiniteSlice(layer.s_bias.data);
-        try ensureFiniteSlice(layer.t_bias.data);
 
         const lmin_bits = @as(u32, @bitCast(layer.clip_min));
         const lmax_bits = @as(u32, @bitCast(layer.clip_max));
