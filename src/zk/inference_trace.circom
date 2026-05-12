@@ -9,79 +9,72 @@ function FIXED_POINT_SCALE() {
     return 1000000;
 }
 
-function FIXED_POINT_SCALE_SQ() {
-    return 1000000000000;
+function FIXED_POINT_QUADRATIC_DIVISOR() {
+    return 2000000;
 }
 
-function TAYLOR_DENOM_QUADRATIC() {
-    return 2;
-}
-
-function TAYLOR_DENOM_CUBIC() {
-    return 6;
+function FIXED_POINT_CUBIC_DIVISOR() {
+    return 6000000000000;
 }
 
 function REMAINDER_BIT_SIZE() {
     return 20;
 }
 
-function VALUE_BIT_SIZE() {
-    return 64;
+function QUADRATIC_REMAINDER_BIT_SIZE() {
+    return 21;
 }
 
-function COUNT_BIT_SIZE() {
-    return 32;
+function CUBIC_REMAINDER_BIT_SIZE() {
+    return 43;
 }
 
-function EXP_INPUT_BOUND() {
-    return 5000000;
+function INTERNAL_BIT_SIZE() {
+    return 192;
+}
+
+function ERROR_ACCUMULATION_BIT_SIZE() {
+    return 252;
+}
+
+function EXP_INPUT_MAX() {
+    return 1000000;
 }
 
 template PoseidonChain(n) {
+    assert(n > 0);
+
     signal input in[n];
     signal output out;
 
-    var num_chunks;
-    if (n == 0) {
-        num_chunks = 1;
-    } else {
-        num_chunks = (n + 4) \ 5;
-    }
+    var num_chunks = (n + 5) \ 6;
 
-    component data_hashers[num_chunks];
-    component carry_hashers[num_chunks];
-    signal intermediate[num_chunks];
+    signal chain[num_chunks + 1];
+
+    component block_hashers[num_chunks];
+    component chain_hashers[num_chunks];
+
+    chain[0] <== 0;
 
     for (var chunk = 0; chunk < num_chunks; chunk++) {
-        var chunk_start = chunk * 5;
-        var chunk_size = 5;
-        if (chunk_start + chunk_size > n) {
-            chunk_size = n - chunk_start;
-        }
-        if (chunk_size < 0) {
-            chunk_size = 0;
-        }
+        block_hashers[chunk] = Poseidon(6);
 
-        data_hashers[chunk] = Poseidon(5);
-        for (var k = 0; k < 5; k++) {
-            if (k < chunk_size) {
-                data_hashers[chunk].inputs[k] <== in[chunk_start + k];
+        for (var j = 0; j < 6; j++) {
+            if (chunk * 6 + j < n) {
+                block_hashers[chunk].inputs[j] <== in[chunk * 6 + j];
             } else {
-                data_hashers[chunk].inputs[k] <== 0;
+                block_hashers[chunk].inputs[j] <== 0;
             }
         }
 
-        carry_hashers[chunk] = Poseidon(2);
-        carry_hashers[chunk].inputs[0] <== data_hashers[chunk].out;
-        if (chunk == 0) {
-            carry_hashers[chunk].inputs[1] <== 0;
-        } else {
-            carry_hashers[chunk].inputs[1] <== intermediate[chunk - 1];
-        }
-        intermediate[chunk] <== carry_hashers[chunk].out;
+        chain_hashers[chunk] = Poseidon(2);
+        chain_hashers[chunk].inputs[0] <== chain[chunk];
+        chain_hashers[chunk].inputs[1] <== block_hashers[chunk].out;
+
+        chain[chunk + 1] <== chain_hashers[chunk].out;
     }
 
-    out <== intermediate[num_chunks - 1];
+    out <== chain[num_chunks];
 }
 
 template SafeIsZero() {
@@ -89,14 +82,15 @@ template SafeIsZero() {
     signal output out;
 
     signal inv;
+    signal prod;
+
     inv <-- in != 0 ? 1 / in : 0;
 
-    signal prod;
     prod <== in * inv;
-
     out <== 1 - prod;
 
     in * out === 0;
+    out * (out - 1) === 0;
 }
 
 template SafeIsEqual() {
@@ -105,12 +99,14 @@ template SafeIsEqual() {
     signal output out;
 
     signal diff;
+
+    component is_zero = SafeIsZero();
+
     diff <== a - b;
 
-    component isz = SafeIsZero();
-    isz.in <== diff;
+    is_zero.in <== diff;
 
-    out <== isz.out;
+    out <== is_zero.out;
 }
 
 template HashCommit() {
@@ -119,165 +115,184 @@ template HashCommit() {
     signal output commitment;
 
     component hasher = Poseidon(2);
+
     hasher.inputs[0] <== value;
     hasher.inputs[1] <== blinding;
 
     commitment <== hasher.out;
 }
 
-template SignedAbs(bits) {
-    signal input in;
-    signal output out;
-    signal output is_negative;
-
-    signal shifted;
-    shifted <== in + (1 << bits);
-
-    component n2b = Num2Bits(bits + 1);
-    n2b.in <== shifted;
-
-    is_negative <== 1 - n2b.out[bits];
-
-    signal neg_in;
-    neg_in <== 0 - in;
-
-    out <== is_negative * neg_in + (1 - is_negative) * in;
-
-    component check_pos = Num2Bits(bits);
-    check_pos.in <== out;
-}
-
-template SafeLessThan(bits) {
-    signal input a;
-    signal input b;
-    signal output out;
-
-    component a_check = Num2Bits(bits);
-    a_check.in <== a;
-
-    component b_check = Num2Bits(bits);
-    b_check.in <== b;
-
-    component lt = LessThan(bits);
-    lt.in[0] <== a;
-    lt.in[1] <== b;
-
-    out <== lt.out;
-}
-
-template RSFLayerComputation(dim) {
-    signal input x[dim];
-    signal input weights_s[dim \ 2][dim \ 2];
-    signal input weights_t[dim \ 2][dim \ 2];
-    signal input bias_s[dim \ 2];
-    signal input bias_t[dim \ 2];
-    signal input expected_commitment;
-    signal output y[dim];
-    signal output valid_commitment;
+template RSFLayerComputation(dim, precision_bits) {
+    assert(dim > 0);
+    assert(dim % 2 == 0);
+    assert(precision_bits > 0);
+    assert(precision_bits <= 64);
 
     var half = dim \ 2;
 
+    signal input x[dim];
+    signal input weights_s[half][half];
+    signal input weights_t[half][half];
+    signal input bias_s[half];
+    signal input bias_t[half];
+    signal input expected_commitment;
+
+    signal output y[dim];
+    signal output valid_commitment;
+
+    component x_range[dim];
+    component weights_s_range[half][half];
+    component weights_t_range[half][half];
+    component bias_s_range[half];
+    component bias_t_range[half];
+
     signal x1[half];
     signal x2[half];
+
+    for (var i = 0; i < dim; i++) {
+        x_range[i] = Num2Bits(precision_bits);
+        x_range[i].in <== x[i];
+    }
+
     for (var i = 0; i < half; i++) {
         x1[i] <== x[i];
         x2[i] <== x[half + i];
-    }
 
-    signal s_terms[half][half];
-    signal s_partial[half][half + 1];
-    signal s_x2_unbiased[half];
-    signal s_x2[half];
+        bias_s_range[i] = Num2Bits(precision_bits);
+        bias_s_range[i].in <== bias_s[i];
 
-    for (var i = 0; i < half; i++) {
-        s_partial[i][0] <== 0;
+        bias_t_range[i] = Num2Bits(precision_bits);
+        bias_t_range[i].in <== bias_t[i];
+
         for (var j = 0; j < half; j++) {
-            s_terms[i][j] <== weights_s[i][j] * x2[j];
-            s_partial[i][j + 1] <== s_partial[i][j] + s_terms[i][j];
+            weights_s_range[i][j] = Num2Bits(precision_bits);
+            weights_s_range[i][j].in <== weights_s[i][j];
+
+            weights_t_range[i][j] = Num2Bits(precision_bits);
+            weights_t_range[i][j].in <== weights_t[i][j];
         }
-        s_x2_unbiased[i] <== s_partial[i][half];
-        s_x2[i] <== s_x2_unbiased[i] + bias_s[i];
     }
 
-    signal s_clipped[half];
-    component s_abs[half];
-    component s_in_bound[half];
+    signal s_accumulators[half][half + 1];
+    signal s_products[half][half];
+    signal s_pre_clip[half];
 
     for (var i = 0; i < half; i++) {
-        s_abs[i] = SignedAbs(VALUE_BIT_SIZE());
-        s_abs[i].in <== s_x2[i];
+        s_accumulators[i][0] <== bias_s[i];
 
-        s_in_bound[i] = SafeLessThan(VALUE_BIT_SIZE());
-        s_in_bound[i].a <== s_abs[i].out;
-        s_in_bound[i].b <== EXP_INPUT_BOUND();
-        s_in_bound[i].out === 1;
+        for (var j = 0; j < half; j++) {
+            s_products[i][j] <== weights_s[i][j] * x2[j];
+            s_accumulators[i][j + 1] <== s_accumulators[i][j] + s_products[i][j];
+        }
 
-        s_clipped[i] <== s_x2[i];
+        s_pre_clip[i] <== s_accumulators[i][half];
     }
 
-    signal s_sq[half];
-    signal s_cu[half];
-    signal taylor_lin[half];
-    signal taylor_quad_num[half];
-    signal taylor_cub_num[half];
-    signal exp_num[half];
+    component s_pre_clip_range[half];
+    component s_clip_selector[half];
+
+    signal clipped_s[half];
+
+    for (var i = 0; i < half; i++) {
+        s_pre_clip_range[i] = Num2Bits(INTERNAL_BIT_SIZE());
+        s_pre_clip_range[i].in <== s_pre_clip[i];
+
+        s_clip_selector[i] = LessThan(INTERNAL_BIT_SIZE());
+        s_clip_selector[i].in[0] <== s_pre_clip[i];
+        s_clip_selector[i].in[1] <== EXP_INPUT_MAX() + 1;
+
+        clipped_s[i] <== s_clip_selector[i].out * s_pre_clip[i] + (1 - s_clip_selector[i].out) * EXP_INPUT_MAX();
+    }
+
+    signal s_square[half];
+    signal s_cubic[half];
+
+    signal quadratic_quotient[half];
+    signal quadratic_remainder[half];
+    signal cubic_quotient[half];
+    signal cubic_remainder[half];
+
+    component quadratic_remainder_bound[half];
+    component cubic_remainder_bound[half];
+
+    signal exp_scaled[half];
+
     signal x1_scaled[half];
-    signal y1[half];
-    signal y1_rem[half];
+    signal y1_quotient[half];
+    signal y1_remainder[half];
 
-    component rem_check[half];
-    component rem_range[half];
-    component quot_range[half];
+    component y1_remainder_bound[half];
+    component y1_range[half];
+
+    signal y1[half];
 
     for (var i = 0; i < half; i++) {
-        s_sq[i] <== s_clipped[i] * s_clipped[i];
-        s_cu[i] <== s_sq[i] * s_clipped[i];
+        s_square[i] <== clipped_s[i] * clipped_s[i];
+        s_cubic[i] <== s_square[i] * clipped_s[i];
 
-        taylor_lin[i] <== s_clipped[i] * FIXED_POINT_SCALE();
-        taylor_quad_num[i] <== s_sq[i];
-        taylor_cub_num[i] <== s_cu[i];
+        quadratic_quotient[i] <-- s_square[i] \ FIXED_POINT_QUADRATIC_DIVISOR();
+        quadratic_remainder[i] <-- s_square[i] % FIXED_POINT_QUADRATIC_DIVISOR();
 
-        exp_num[i] <== FIXED_POINT_SCALE_SQ() * TAYLOR_DENOM_CUBIC()
-                    + taylor_lin[i] * TAYLOR_DENOM_CUBIC() * FIXED_POINT_SCALE() / FIXED_POINT_SCALE()
-                    + taylor_quad_num[i] * TAYLOR_DENOM_CUBIC() / TAYLOR_DENOM_QUADRATIC()
-                    + taylor_cub_num[i];
+        quadratic_quotient[i] * FIXED_POINT_QUADRATIC_DIVISOR() + quadratic_remainder[i] === s_square[i];
 
-        x1_scaled[i] <== x1[i] * exp_num[i];
+        quadratic_remainder_bound[i] = LessThan(QUADRATIC_REMAINDER_BIT_SIZE());
+        quadratic_remainder_bound[i].in[0] <== quadratic_remainder[i];
+        quadratic_remainder_bound[i].in[1] <== FIXED_POINT_QUADRATIC_DIVISOR();
+        quadratic_remainder_bound[i].out === 1;
 
-        var divisor = FIXED_POINT_SCALE_SQ() * TAYLOR_DENOM_CUBIC();
+        cubic_quotient[i] <-- s_cubic[i] \ FIXED_POINT_CUBIC_DIVISOR();
+        cubic_remainder[i] <-- s_cubic[i] % FIXED_POINT_CUBIC_DIVISOR();
 
-        y1[i] <-- x1_scaled[i] \ divisor;
-        y1_rem[i] <-- x1_scaled[i] % divisor;
+        cubic_quotient[i] * FIXED_POINT_CUBIC_DIVISOR() + cubic_remainder[i] === s_cubic[i];
 
-        y1[i] * divisor + y1_rem[i] === x1_scaled[i];
+        cubic_remainder_bound[i] = LessThan(CUBIC_REMAINDER_BIT_SIZE());
+        cubic_remainder_bound[i].in[0] <== cubic_remainder[i];
+        cubic_remainder_bound[i].in[1] <== FIXED_POINT_CUBIC_DIVISOR();
+        cubic_remainder_bound[i].out === 1;
 
-        rem_range[i] = Num2Bits(VALUE_BIT_SIZE());
-        rem_range[i].in <== y1_rem[i];
+        exp_scaled[i] <== FIXED_POINT_SCALE() + clipped_s[i] + quadratic_quotient[i] + cubic_quotient[i];
 
-        quot_range[i] = Num2Bits(VALUE_BIT_SIZE());
-        quot_range[i].in <== y1[i] + (1 << (VALUE_BIT_SIZE() - 1));
+        x1_scaled[i] <== x1[i] * exp_scaled[i];
 
-        rem_check[i] = SafeLessThan(VALUE_BIT_SIZE());
-        rem_check[i].a <== y1_rem[i];
-        rem_check[i].b <== divisor;
-        rem_check[i].out === 1;
+        y1_quotient[i] <-- x1_scaled[i] \ FIXED_POINT_SCALE();
+        y1_remainder[i] <-- x1_scaled[i] % FIXED_POINT_SCALE();
+
+        y1_quotient[i] * FIXED_POINT_SCALE() + y1_remainder[i] === x1_scaled[i];
+
+        y1_remainder_bound[i] = LessThan(REMAINDER_BIT_SIZE());
+        y1_remainder_bound[i].in[0] <== y1_remainder[i];
+        y1_remainder_bound[i].in[1] <== FIXED_POINT_SCALE();
+        y1_remainder_bound[i].out === 1;
+
+        y1_range[i] = Num2Bits(precision_bits);
+        y1_range[i].in <== y1_quotient[i];
+
+        y1[i] <== y1_quotient[i];
     }
 
-    signal t_terms[half][half];
-    signal t_partial[half][half + 1];
-    signal t_y1_unbiased[half];
+    signal t_accumulators[half][half + 1];
+    signal t_products[half][half];
     signal t_y1[half];
-    signal y2[half];
 
     for (var i = 0; i < half; i++) {
-        t_partial[i][0] <== 0;
+        t_accumulators[i][0] <== bias_t[i];
+
         for (var j = 0; j < half; j++) {
-            t_terms[i][j] <== weights_t[i][j] * y1[j];
-            t_partial[i][j + 1] <== t_partial[i][j] + t_terms[i][j];
+            t_products[i][j] <== weights_t[i][j] * y1[j];
+            t_accumulators[i][j + 1] <== t_accumulators[i][j] + t_products[i][j];
         }
-        t_y1_unbiased[i] <== t_partial[i][half];
-        t_y1[i] <== t_y1_unbiased[i] + bias_t[i];
+
+        t_y1[i] <== t_accumulators[i][half];
+    }
+
+    signal y2[half];
+    component y2_range[half];
+
+    for (var i = 0; i < half; i++) {
         y2[i] <== x2[i] + t_y1[i];
+
+        y2_range[i] = Num2Bits(precision_bits);
+        y2_range[i].in <== y2[i];
     }
 
     for (var i = 0; i < half; i++) {
@@ -286,43 +301,52 @@ template RSFLayerComputation(dim) {
     }
 
     component output_hash = PoseidonChain(dim);
+
     for (var i = 0; i < dim; i++) {
         output_hash.in[i] <== y[i];
     }
 
     component commit_check = SafeIsEqual();
+
     commit_check.a <== output_hash.out;
     commit_check.b <== expected_commitment;
 
     valid_commitment <== commit_check.out;
+    valid_commitment * (valid_commitment - 1) === 0;
 }
 
 template FullInferenceProof(num_layers, dim, precision_bits) {
+    assert(num_layers > 0);
+    assert(dim > 0);
+    assert(dim % 2 == 0);
+    assert(precision_bits > 0);
+    assert(precision_bits <= 64);
+
+    var half = dim \ 2;
+
     signal input tokens[dim];
-    signal input layer_weights_s[num_layers][dim \ 2][dim \ 2];
-    signal input layer_weights_t[num_layers][dim \ 2][dim \ 2];
-    signal input layer_bias_s[num_layers][dim \ 2];
-    signal input layer_bias_t[num_layers][dim \ 2];
+    signal input layer_weights_s[num_layers][half][half];
+    signal input layer_weights_t[num_layers][half][half];
+    signal input layer_biases_s[num_layers][half];
+    signal input layer_biases_t[num_layers][half];
     signal input expected_output[dim];
     signal input input_commitment;
     signal input output_commitment;
     signal input layer_commitments[num_layers];
     signal input max_error_squared;
+
     signal output is_valid;
 
-    var half = dim \ 2;
-
     signal layer_outputs[num_layers + 1][dim];
-    for (var i = 0; i < dim; i++) {
-        layer_outputs[0][i] <== tokens[i];
-    }
 
     component input_hash = PoseidonChain(dim);
+    component input_check = SafeIsEqual();
+
     for (var i = 0; i < dim; i++) {
+        layer_outputs[0][i] <== tokens[i];
         input_hash.in[i] <== tokens[i];
     }
 
-    component input_check = SafeIsEqual();
     input_check.a <== input_hash.out;
     input_check.b <== input_commitment;
 
@@ -330,19 +354,20 @@ template FullInferenceProof(num_layers, dim, precision_bits) {
     signal layer_valid[num_layers];
 
     for (var layer = 0; layer < num_layers; layer++) {
-        rsf_layers[layer] = RSFLayerComputation(dim);
+        rsf_layers[layer] = RSFLayerComputation(dim, precision_bits);
 
         for (var i = 0; i < dim; i++) {
             rsf_layers[layer].x[i] <== layer_outputs[layer][i];
         }
 
         for (var i = 0; i < half; i++) {
+            rsf_layers[layer].bias_s[i] <== layer_biases_s[layer][i];
+            rsf_layers[layer].bias_t[i] <== layer_biases_t[layer][i];
+
             for (var j = 0; j < half; j++) {
                 rsf_layers[layer].weights_s[i][j] <== layer_weights_s[layer][i][j];
                 rsf_layers[layer].weights_t[i][j] <== layer_weights_t[layer][i][j];
             }
-            rsf_layers[layer].bias_s[i] <== layer_bias_s[layer][i];
-            rsf_layers[layer].bias_t[i] <== layer_bias_t[layer][i];
         }
 
         rsf_layers[layer].expected_commitment <== layer_commitments[layer];
@@ -355,57 +380,65 @@ template FullInferenceProof(num_layers, dim, precision_bits) {
     }
 
     component output_hash = PoseidonChain(dim);
+    component output_check = SafeIsEqual();
+
     for (var i = 0; i < dim; i++) {
         output_hash.in[i] <== layer_outputs[num_layers][i];
     }
 
-    component output_check = SafeIsEqual();
     output_check.a <== output_hash.out;
     output_check.b <== output_commitment;
 
-    signal diff[dim];
-    signal diff_squared[dim];
-    component diff_abs[dim];
+    component expected_output_range[dim];
 
     for (var i = 0; i < dim; i++) {
-        diff[i] <== layer_outputs[num_layers][i] - expected_output[i];
-        diff_abs[i] = SignedAbs(precision_bits \ 2);
-        diff_abs[i].in <== diff[i];
-        diff_squared[i] <== diff_abs[i].out * diff_abs[i].out;
+        expected_output_range[i] = Num2Bits(precision_bits);
+        expected_output_range[i].in <== expected_output[i];
     }
 
+    component diff_less_than[dim];
+
+    signal abs_diff[dim];
+    signal diff_squared[dim];
     signal error_sum[dim + 1];
+
     error_sum[0] <== 0;
+
     for (var i = 0; i < dim; i++) {
+        diff_less_than[i] = LessThan(precision_bits);
+        diff_less_than[i].in[0] <== layer_outputs[num_layers][i];
+        diff_less_than[i].in[1] <== expected_output[i];
+
+        abs_diff[i] <== diff_less_than[i].out * (expected_output[i] - layer_outputs[num_layers][i]) + (1 - diff_less_than[i].out) * (layer_outputs[num_layers][i] - expected_output[i]);
+
+        diff_squared[i] <== abs_diff[i] * abs_diff[i];
+
         error_sum[i + 1] <== error_sum[i] + diff_squared[i];
     }
 
-    component error_range = Num2Bits(precision_bits);
-    error_range.in <== error_sum[dim];
+    component max_error_range = Num2Bits(ERROR_ACCUMULATION_BIT_SIZE());
+    component error_check = LessThan(ERROR_ACCUMULATION_BIT_SIZE());
 
-    component max_err_range = Num2Bits(precision_bits);
-    max_err_range.in <== max_error_squared;
+    max_error_range.in <== max_error_squared;
 
-    component error_check = LessThan(precision_bits);
     error_check.in[0] <== error_sum[dim];
     error_check.in[1] <== max_error_squared;
 
     signal all_layers_valid[num_layers + 1];
+
     all_layers_valid[0] <== 1;
+
     for (var layer = 0; layer < num_layers; layer++) {
         all_layers_valid[layer + 1] <== all_layers_valid[layer] * layer_valid[layer];
     }
 
-    signal v1;
-    v1 <== input_check.out * output_check.out;
+    signal input_and_output_valid;
+    signal commitment_and_error_valid;
 
-    signal v2;
-    v2 <== v1 * error_check.out;
+    input_and_output_valid <== input_check.out * output_check.out;
+    commitment_and_error_valid <== input_and_output_valid * error_check.out;
 
-    signal v3;
-    v3 <== v2 * all_layers_valid[num_layers];
-
-    is_valid <== v3;
+    is_valid <== commitment_and_error_valid * all_layers_valid[num_layers];
     is_valid * (is_valid - 1) === 0;
 }
 
