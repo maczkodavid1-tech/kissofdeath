@@ -9,119 +9,76 @@ function FIXED_POINT_SCALE() {
     return 1000000;
 }
 
-function TAYLOR_COEFF_LINEAR() {
-    return 1000;
+function FIXED_POINT_SCALE_SQ() {
+    return 1000000000000;
 }
 
-function TAYLOR_COEFF_QUADRATIC() {
-    return 500;
+function TAYLOR_DENOM_QUADRATIC() {
+    return 2;
 }
 
-function TAYLOR_COEFF_CUBIC() {
-    return 167;
+function TAYLOR_DENOM_CUBIC() {
+    return 6;
 }
 
 function REMAINDER_BIT_SIZE() {
-    return 21;
+    return 20;
 }
 
-function SHA256_DIGEST_SIZE() {
+function VALUE_BIT_SIZE() {
+    return 64;
+}
+
+function COUNT_BIT_SIZE() {
     return 32;
 }
 
-function DEFAULT_BATCH_SIZE() {
-    return 64;
+function EXP_INPUT_BOUND() {
+    return 5000000;
 }
 
 template PoseidonChain(n) {
     signal input in[n];
     signal output out;
 
-    var num_chunks = (n + 5) \ 6;
+    var num_chunks;
+    if (n == 0) {
+        num_chunks = 1;
+    } else {
+        num_chunks = (n + 4) \ 5;
+    }
+
+    component data_hashers[num_chunks];
+    component carry_hashers[num_chunks];
     signal intermediate[num_chunks];
 
     for (var chunk = 0; chunk < num_chunks; chunk++) {
-        var chunk_size = 6;
-        if (chunk == num_chunks - 1) {
-            var remaining = n - chunk * 6;
-            if (remaining < chunk_size) {
-                chunk_size = remaining;
+        var chunk_start = chunk * 5;
+        var chunk_size = 5;
+        if (chunk_start + chunk_size > n) {
+            chunk_size = n - chunk_start;
+        }
+        if (chunk_size < 0) {
+            chunk_size = 0;
+        }
+
+        data_hashers[chunk] = Poseidon(5);
+        for (var k = 0; k < 5; k++) {
+            if (k < chunk_size) {
+                data_hashers[chunk].inputs[k] <== in[chunk_start + k];
+            } else {
+                data_hashers[chunk].inputs[k] <== 0;
             }
         }
 
-        if (chunk_size == 1) {
-            component h = Poseidon(2);
-            h.inputs[0] <== in[chunk * 6];
-            if (chunk > 0) {
-                h.inputs[1] <== intermediate[chunk - 1];
-            } else {
-                h.inputs[1] <== 0;
-            }
-            intermediate[chunk] <== h.out;
-        } else if (chunk_size == 2) {
-            component h = Poseidon(3);
-            h.inputs[0] <== in[chunk * 6];
-            h.inputs[1] <== in[chunk * 6 + 1];
-            if (chunk > 0) {
-                h.inputs[2] <== intermediate[chunk - 1];
-            } else {
-                h.inputs[2] <== 0;
-            }
-            intermediate[chunk] <== h.out;
-        } else if (chunk_size == 3) {
-            component h = Poseidon(4);
-            h.inputs[0] <== in[chunk * 6];
-            h.inputs[1] <== in[chunk * 6 + 1];
-            h.inputs[2] <== in[chunk * 6 + 2];
-            if (chunk > 0) {
-                h.inputs[3] <== intermediate[chunk - 1];
-            } else {
-                h.inputs[3] <== 0;
-            }
-            intermediate[chunk] <== h.out;
-        } else if (chunk_size == 4) {
-            component h = Poseidon(5);
-            h.inputs[0] <== in[chunk * 6];
-            h.inputs[1] <== in[chunk * 6 + 1];
-            h.inputs[2] <== in[chunk * 6 + 2];
-            h.inputs[3] <== in[chunk * 6 + 3];
-            if (chunk > 0) {
-                h.inputs[4] <== intermediate[chunk - 1];
-            } else {
-                h.inputs[4] <== 0;
-            }
-            intermediate[chunk] <== h.out;
-        } else if (chunk_size == 5) {
-            component h = Poseidon(6);
-            h.inputs[0] <== in[chunk * 6];
-            h.inputs[1] <== in[chunk * 6 + 1];
-            h.inputs[2] <== in[chunk * 6 + 2];
-            h.inputs[3] <== in[chunk * 6 + 3];
-            h.inputs[4] <== in[chunk * 6 + 4];
-            if (chunk > 0) {
-                h.inputs[5] <== intermediate[chunk - 1];
-            } else {
-                h.inputs[5] <== 0;
-            }
-            intermediate[chunk] <== h.out;
+        carry_hashers[chunk] = Poseidon(2);
+        carry_hashers[chunk].inputs[0] <== data_hashers[chunk].out;
+        if (chunk == 0) {
+            carry_hashers[chunk].inputs[1] <== 0;
         } else {
-            component h = Poseidon(6);
-            h.inputs[0] <== in[chunk * 6];
-            h.inputs[1] <== in[chunk * 6 + 1];
-            h.inputs[2] <== in[chunk * 6 + 2];
-            h.inputs[3] <== in[chunk * 6 + 3];
-            h.inputs[4] <== in[chunk * 6 + 4];
-            h.inputs[5] <== in[chunk * 6 + 5];
-
-            if (chunk > 0) {
-                component h2 = Poseidon(2);
-                h2.inputs[0] <== h.out;
-                h2.inputs[1] <== intermediate[chunk - 1];
-                intermediate[chunk] <== h2.out;
-            } else {
-                intermediate[chunk] <== h.out;
-            }
+            carry_hashers[chunk].inputs[1] <== intermediate[chunk - 1];
         }
+        intermediate[chunk] <== carry_hashers[chunk].out;
     }
 
     out <== intermediate[num_chunks - 1];
@@ -156,7 +113,7 @@ template SafeIsEqual() {
     out <== isz.out;
 }
 
-template PedersenCommit() {
+template HashCommit() {
     signal input value;
     signal input blinding;
     signal output commitment;
@@ -168,94 +125,57 @@ template PedersenCommit() {
     commitment <== hasher.out;
 }
 
-template VerifyMerkleProof(depth) {
-    signal input leaf;
-    signal input path_elements[depth];
-    signal input path_indices[depth];
-    signal output root;
+template SignedAbs(bits) {
+    signal input in;
+    signal output out;
+    signal output is_negative;
 
-    signal hashes[depth + 1];
-    hashes[0] <== leaf;
+    signal shifted;
+    shifted <== in + (1 << bits);
 
-    component hashers[depth];
-    component muxers_left[depth];
-    component muxers_right[depth];
+    component n2b = Num2Bits(bits + 1);
+    n2b.in <== shifted;
 
-    for (var i = 0; i < depth; i++) {
-        path_indices[i] * (path_indices[i] - 1) === 0;
+    is_negative <== 1 - n2b.out[bits];
 
-        muxers_left[i] = Mux1();
-        muxers_left[i].c[0] <== hashes[i];
-        muxers_left[i].c[1] <== path_elements[i];
-        muxers_left[i].s <== path_indices[i];
+    signal neg_in;
+    neg_in <== 0 - in;
 
-        muxers_right[i] = Mux1();
-        muxers_right[i].c[0] <== path_elements[i];
-        muxers_right[i].c[1] <== hashes[i];
-        muxers_right[i].s <== path_indices[i];
+    out <== is_negative * neg_in + (1 - is_negative) * in;
 
-        hashers[i] = Poseidon(2);
-        hashers[i].inputs[0] <== muxers_left[i].out;
-        hashers[i].inputs[1] <== muxers_right[i].out;
-
-        hashes[i + 1] <== hashers[i].out;
-    }
-
-    root <== hashes[depth];
+    component check_pos = Num2Bits(bits);
+    check_pos.in <== out;
 }
 
-template RangeProof(bits) {
-    signal input value;
-    signal input min_value;
-    signal input max_value;
-    signal input commitments[bits];
-    signal input openings[bits];
-    signal output valid;
+template SafeLessThan(bits) {
+    signal input a;
+    signal input b;
+    signal output out;
 
-    signal normalized;
-    normalized <== value - min_value;
+    component a_check = Num2Bits(bits);
+    a_check.in <== a;
 
-    component bit_decomp = Num2Bits(bits);
-    bit_decomp.in <== normalized;
+    component b_check = Num2Bits(bits);
+    b_check.in <== b;
 
-    component lt_check = LessThan(bits + 1);
-    lt_check.in[0] <== normalized;
-    lt_check.in[1] <== max_value - min_value + 1;
+    component lt = LessThan(bits);
+    lt.in[0] <== a;
+    lt.in[1] <== b;
 
-    component pedersen_commits[bits];
-    component eq_checks[bits];
-    signal bit_valid[bits];
-
-    for (var i = 0; i < bits; i++) {
-        pedersen_commits[i] = PedersenCommit();
-        pedersen_commits[i].value <== bit_decomp.out[i];
-        pedersen_commits[i].blinding <== openings[i];
-
-        eq_checks[i] = SafeIsEqual();
-        eq_checks[i].a <== pedersen_commits[i].commitment;
-        eq_checks[i].b <== commitments[i];
-
-        bit_valid[i] <== eq_checks[i].out;
-    }
-
-    signal all_valid[bits + 1];
-    all_valid[0] <== 1;
-    for (var i = 0; i < bits; i++) {
-        all_valid[i + 1] <== all_valid[i] * bit_valid[i];
-    }
-
-    valid <== all_valid[bits] * lt_check.out;
+    out <== lt.out;
 }
 
 template RSFLayerComputation(dim) {
     signal input x[dim];
-    signal input weights_s[dim][dim];
-    signal input weights_t[dim][dim];
+    signal input weights_s[dim \ 2][dim \ 2];
+    signal input weights_t[dim \ 2][dim \ 2];
+    signal input bias_s[dim \ 2];
+    signal input bias_t[dim \ 2];
     signal input expected_commitment;
     signal output y[dim];
     signal output valid_commitment;
 
-    var half = dim / 2;
+    var half = dim \ 2;
 
     signal x1[half];
     signal x2[half];
@@ -264,76 +184,99 @@ template RSFLayerComputation(dim) {
         x2[i] <== x[half + i];
     }
 
+    signal s_terms[half][half];
+    signal s_partial[half][half + 1];
+    signal s_x2_unbiased[half];
     signal s_x2[half];
+
     for (var i = 0; i < half; i++) {
-        signal partial[half + 1];
-        partial[0] <== 0;
+        s_partial[i][0] <== 0;
         for (var j = 0; j < half; j++) {
-            signal term;
-            term <== weights_s[i][j] * x2[j];
-            partial[j + 1] <== partial[j] + term;
+            s_terms[i][j] <== weights_s[i][j] * x2[j];
+            s_partial[i][j + 1] <== s_partial[i][j] + s_terms[i][j];
         }
-        s_x2[i] <== partial[half];
+        s_x2_unbiased[i] <== s_partial[i][half];
+        s_x2[i] <== s_x2_unbiased[i] + bias_s[i];
     }
 
+    signal s_clipped[half];
+    component s_abs[half];
+    component s_in_bound[half];
+
+    for (var i = 0; i < half; i++) {
+        s_abs[i] = SignedAbs(VALUE_BIT_SIZE());
+        s_abs[i].in <== s_x2[i];
+
+        s_in_bound[i] = SafeLessThan(VALUE_BIT_SIZE());
+        s_in_bound[i].a <== s_abs[i].out;
+        s_in_bound[i].b <== EXP_INPUT_BOUND();
+        s_in_bound[i].out === 1;
+
+        s_clipped[i] <== s_x2[i];
+    }
+
+    signal s_sq[half];
+    signal s_cu[half];
+    signal taylor_lin[half];
+    signal taylor_quad_num[half];
+    signal taylor_cub_num[half];
+    signal exp_num[half];
+    signal x1_scaled[half];
     signal y1[half];
+    signal y1_rem[half];
+
+    component rem_check[half];
+    component rem_range[half];
+    component quot_range[half];
+
     for (var i = 0; i < half; i++) {
-        signal s_val;
-        s_val <== s_x2[i];
+        s_sq[i] <== s_clipped[i] * s_clipped[i];
+        s_cu[i] <== s_sq[i] * s_clipped[i];
 
-        signal s_sq;
-        s_sq <== s_val * s_val;
+        taylor_lin[i] <== s_clipped[i] * FIXED_POINT_SCALE();
+        taylor_quad_num[i] <== s_sq[i];
+        taylor_cub_num[i] <== s_cu[i];
 
-        signal s_cu;
-        s_cu <== s_sq * s_val;
+        exp_num[i] <== FIXED_POINT_SCALE_SQ() * TAYLOR_DENOM_CUBIC()
+                    + taylor_lin[i] * TAYLOR_DENOM_CUBIC() * FIXED_POINT_SCALE() / FIXED_POINT_SCALE()
+                    + taylor_quad_num[i] * TAYLOR_DENOM_CUBIC() / TAYLOR_DENOM_QUADRATIC()
+                    + taylor_cub_num[i];
 
-        signal taylor_1;
-        taylor_1 <== FIXED_POINT_SCALE();
+        x1_scaled[i] <== x1[i] * exp_num[i];
 
-        signal taylor_2;
-        taylor_2 <== s_val * TAYLOR_COEFF_LINEAR();
+        var divisor = FIXED_POINT_SCALE_SQ() * TAYLOR_DENOM_CUBIC();
 
-        signal taylor_3;
-        taylor_3 <== s_sq * TAYLOR_COEFF_QUADRATIC();
+        y1[i] <-- x1_scaled[i] \ divisor;
+        y1_rem[i] <-- x1_scaled[i] % divisor;
 
-        signal taylor_4;
-        taylor_4 <== s_cu * TAYLOR_COEFF_CUBIC();
+        y1[i] * divisor + y1_rem[i] === x1_scaled[i];
 
-        signal exp_scaled;
-        exp_scaled <== taylor_1 + taylor_2 + taylor_3 + taylor_4;
+        rem_range[i] = Num2Bits(VALUE_BIT_SIZE());
+        rem_range[i].in <== y1_rem[i];
 
-        signal x1_scaled;
-        x1_scaled <== x1[i] * exp_scaled;
+        quot_range[i] = Num2Bits(VALUE_BIT_SIZE());
+        quot_range[i].in <== y1[i] + (1 << (VALUE_BIT_SIZE() - 1));
 
-        signal quotient;
-        signal remainder;
-        quotient <-- x1_scaled \ FIXED_POINT_SCALE();
-        remainder <-- x1_scaled % FIXED_POINT_SCALE();
-
-        quotient * FIXED_POINT_SCALE() + remainder === x1_scaled;
-
-        component lt_rem = LessThan(REMAINDER_BIT_SIZE());
-        lt_rem.in[0] <== remainder;
-        lt_rem.in[1] <== FIXED_POINT_SCALE();
-        lt_rem.out === 1;
-
-        y1[i] <== quotient;
+        rem_check[i] = SafeLessThan(VALUE_BIT_SIZE());
+        rem_check[i].a <== y1_rem[i];
+        rem_check[i].b <== divisor;
+        rem_check[i].out === 1;
     }
 
+    signal t_terms[half][half];
+    signal t_partial[half][half + 1];
+    signal t_y1_unbiased[half];
     signal t_y1[half];
-    for (var i = 0; i < half; i++) {
-        signal partial[half + 1];
-        partial[0] <== 0;
-        for (var j = 0; j < half; j++) {
-            signal term;
-            term <== weights_t[i][j] * y1[j];
-            partial[j + 1] <== partial[j] + term;
-        }
-        t_y1[i] <== partial[half];
-    }
-
     signal y2[half];
+
     for (var i = 0; i < half; i++) {
+        t_partial[i][0] <== 0;
+        for (var j = 0; j < half; j++) {
+            t_terms[i][j] <== weights_t[i][j] * y1[j];
+            t_partial[i][j + 1] <== t_partial[i][j] + t_terms[i][j];
+        }
+        t_y1_unbiased[i] <== t_partial[i][half];
+        t_y1[i] <== t_y1_unbiased[i] + bias_t[i];
         y2[i] <== x2[i] + t_y1[i];
     }
 
@@ -354,334 +297,20 @@ template RSFLayerComputation(dim) {
     valid_commitment <== commit_check.out;
 }
 
-template VerifyBatchInference(batch_size, dim) {
-    signal input inputs[batch_size][dim];
-    signal input outputs[batch_size][dim];
-    signal input commitments[batch_size];
-    signal input expected_root;
-    signal output valid;
-
-    signal computed_commits[batch_size];
-    component hashers[batch_size];
-    component commit_checks[batch_size];
-
-    for (var b = 0; b < batch_size; b++) {
-        hashers[b] = PoseidonChain(dim);
-        for (var i = 0; i < dim; i++) {
-            hashers[b].in[i] <== outputs[b][i];
-        }
-        computed_commits[b] <== hashers[b].out;
-
-        commit_checks[b] = SafeIsEqual();
-        commit_checks[b].a <== computed_commits[b];
-        commit_checks[b].b <== commitments[b];
-    }
-
-    var tree_depth = 1;
-    var temp_size = batch_size;
-    while (temp_size > 1) {
-        temp_size = (temp_size + 1) / 2;
-        tree_depth = tree_depth + 1;
-    }
-
-    signal tree_nodes[tree_depth + 1][batch_size];
-    for (var i = 0; i < batch_size; i++) {
-        tree_nodes[0][i] <== commitments[i];
-    }
-
-    component tree_hashers[tree_depth][batch_size];
-    var current_width = batch_size;
-
-    for (var level = 0; level < tree_depth; level++) {
-        var next_width = (current_width + 1) / 2;
-        for (var i = 0; i < next_width; i++) {
-            tree_hashers[level][i] = Poseidon(2);
-            tree_hashers[level][i].inputs[0] <== tree_nodes[level][i * 2];
-
-            if (i * 2 + 1 < current_width) {
-                tree_hashers[level][i].inputs[1] <== tree_nodes[level][i * 2 + 1];
-            } else {
-                tree_hashers[level][i].inputs[1] <== tree_nodes[level][i * 2];
-            }
-
-            tree_nodes[level + 1][i] <== tree_hashers[level][i].out;
-        }
-        current_width = next_width;
-    }
-
-    component root_check = SafeIsEqual();
-    root_check.a <== tree_nodes[tree_depth][0];
-    root_check.b <== expected_root;
-
-    signal commit_valid[batch_size + 1];
-    commit_valid[0] <== 1;
-    for (var b = 0; b < batch_size; b++) {
-        commit_valid[b + 1] <== commit_valid[b] * commit_checks[b].out;
-    }
-
-    valid <== commit_valid[batch_size] * root_check.out;
-}
-
-template VerifyNoiseBound(dim, precision_bits) {
-    signal input original[dim];
-    signal input noisy[dim];
-    signal input max_noise;
-    signal output valid;
-
-    signal noise[dim];
-    signal abs_noise[dim];
-    component neg_checks[dim];
-    component bound_checks[dim];
-
-    for (var i = 0; i < dim; i++) {
-        noise[i] <== noisy[i] - original[i];
-
-        neg_checks[i] = LessThan(precision_bits);
-        neg_checks[i].in[0] <== noise[i];
-        neg_checks[i].in[1] <== 0;
-
-        signal neg_noise;
-        neg_noise <== 0 - noise[i];
-
-        abs_noise[i] <== neg_checks[i].out * neg_noise + (1 - neg_checks[i].out) * noise[i];
-
-        bound_checks[i] = LessThan(precision_bits);
-        bound_checks[i].in[0] <== abs_noise[i];
-        bound_checks[i].in[1] <== max_noise;
-    }
-
-    signal all_valid[dim + 1];
-    all_valid[0] <== 1;
-    for (var i = 0; i < dim; i++) {
-        all_valid[i + 1] <== all_valid[i] * bound_checks[i].out;
-    }
-
-    valid <== all_valid[dim];
-}
-
-template VerifyAggregation(num_participants, dim) {
-    signal input contributions[num_participants][dim];
-    signal input participant_commitments[num_participants];
-    signal input aggregated_result[dim];
-    signal input min_threshold;
-    signal output valid;
-
-    component commit_checks[num_participants];
-    for (var p = 0; p < num_participants; p++) {
-        commit_checks[p] = PoseidonChain(dim);
-        for (var i = 0; i < dim; i++) {
-            commit_checks[p].in[i] <== contributions[p][i];
-        }
-    }
-
-    signal commit_valid[num_participants];
-    component commit_eq[num_participants];
-    for (var p = 0; p < num_participants; p++) {
-        commit_eq[p] = SafeIsEqual();
-        commit_eq[p].a <== commit_checks[p].out;
-        commit_eq[p].b <== participant_commitments[p];
-        commit_valid[p] <== commit_eq[p].out;
-    }
-
-    signal sums[dim];
-    for (var i = 0; i < dim; i++) {
-        signal partial[num_participants + 1];
-        partial[0] <== 0;
-        for (var p = 0; p < num_participants; p++) {
-            partial[p + 1] <== partial[p] + contributions[p][i];
-        }
-        sums[i] <== partial[num_participants];
-    }
-
-    signal result_valid[dim];
-    component result_checks[dim];
-    for (var i = 0; i < dim; i++) {
-        result_checks[i] = SafeIsEqual();
-        result_checks[i].a <== sums[i];
-        result_checks[i].b <== aggregated_result[i] * num_participants;
-        result_valid[i] <== result_checks[i].out;
-    }
-
-    component threshold_check = LessThan(SHA256_DIGEST_SIZE());
-    threshold_check.in[0] <== min_threshold - 1;
-    threshold_check.in[1] <== num_participants + 1;
-
-    signal all_commits[num_participants + 1];
-    all_commits[0] <== 1;
-    for (var p = 0; p < num_participants; p++) {
-        all_commits[p + 1] <== all_commits[p] * commit_valid[p];
-    }
-
-    signal all_results[dim + 1];
-    all_results[0] <== 1;
-    for (var i = 0; i < dim; i++) {
-        all_results[i + 1] <== all_results[i] * result_valid[i];
-    }
-
-    valid <== all_commits[num_participants] * all_results[dim] * threshold_check.out;
-}
-
-template DifferentialPrivacyProof(dim) {
-    signal input original[dim];
-    signal input noisy[dim];
-    signal input epsilon;
-    signal input sensitivity;
-    signal input noise_commitments[dim];
-    signal output valid;
-
-    signal noise[dim];
-    signal abs_noise[dim];
-    component neg_checks[dim];
-    component bound_checks[dim];
-    component commit_checks[dim];
-
-    signal max_allowed;
-    signal epsilon_scaled;
-    epsilon_scaled <== epsilon;
-
-    signal sensitivity_scaled;
-    sensitivity_scaled <== sensitivity * 1000;
-
-    signal max_noise_quotient;
-    signal max_noise_remainder;
-    max_noise_quotient <-- sensitivity_scaled \ epsilon_scaled;
-    max_noise_remainder <-- sensitivity_scaled % epsilon_scaled;
-
-    max_noise_quotient * epsilon_scaled + max_noise_remainder === sensitivity_scaled;
-
-    component lt_eps = LessThan(DEFAULT_BATCH_SIZE());
-    lt_eps.in[0] <== max_noise_remainder;
-    lt_eps.in[1] <== epsilon_scaled;
-    lt_eps.out === 1;
-
-    max_allowed <== max_noise_quotient;
-
-    for (var i = 0; i < dim; i++) {
-        noise[i] <== noisy[i] - original[i];
-
-        neg_checks[i] = LessThan(DEFAULT_BATCH_SIZE());
-        neg_checks[i].in[0] <== noise[i];
-        neg_checks[i].in[1] <== 0;
-
-        signal neg_noise;
-        neg_noise <== 0 - noise[i];
-
-        abs_noise[i] <== neg_checks[i].out * neg_noise + (1 - neg_checks[i].out) * noise[i];
-
-        bound_checks[i] = LessThan(DEFAULT_BATCH_SIZE());
-        bound_checks[i].in[0] <== abs_noise[i];
-        bound_checks[i].in[1] <== max_allowed;
-
-        commit_checks[i] = PedersenCommit();
-        commit_checks[i].value <== noise[i];
-        commit_checks[i].blinding <== 0;
-    }
-
-    signal commit_eq[dim];
-    component commit_eq_check[dim];
-    for (var i = 0; i < dim; i++) {
-        commit_eq_check[i] = SafeIsEqual();
-        commit_eq_check[i].a <== commit_checks[i].commitment;
-        commit_eq_check[i].b <== noise_commitments[i];
-        commit_eq[i] <== commit_eq_check[i].out;
-    }
-
-    signal all_valid[dim + 1];
-    all_valid[0] <== 1;
-    for (var i = 0; i < dim; i++) {
-        all_valid[i + 1] <== all_valid[i] * bound_checks[i].out * commit_eq[i];
-    }
-
-    valid <== all_valid[dim];
-}
-
-template SecureAggregationProof(num_participants, dim) {
-    signal input contributions[num_participants][dim];
-    signal input participant_commitments[num_participants];
-    signal input aggregated_result[dim];
-    signal input threshold;
-    signal output valid;
-
-    component threshold_check = LessThan(SHA256_DIGEST_SIZE());
-    threshold_check.in[0] <== threshold - 1;
-    threshold_check.in[1] <== num_participants + 1;
-
-    component commit_hashes[num_participants];
-    component commit_eq[num_participants];
-    signal commit_valid[num_participants];
-
-    for (var p = 0; p < num_participants; p++) {
-        commit_hashes[p] = PoseidonChain(dim);
-        for (var i = 0; i < dim; i++) {
-            commit_hashes[p].in[i] <== contributions[p][i];
-        }
-
-        commit_eq[p] = SafeIsEqual();
-        commit_eq[p].a <== commit_hashes[p].out;
-        commit_eq[p].b <== participant_commitments[p];
-        commit_valid[p] <== commit_eq[p].out;
-    }
-
-    signal sums[dim];
-    for (var i = 0; i < dim; i++) {
-        signal partial[num_participants + 1];
-        partial[0] <== 0;
-        for (var p = 0; p < num_participants; p++) {
-            partial[p + 1] <== partial[p] + contributions[p][i];
-        }
-        sums[i] <== partial[num_participants];
-    }
-
-    signal avg[dim];
-    signal avg_remainder[dim];
-    component avg_lt[dim];
-
-    for (var i = 0; i < dim; i++) {
-        avg[i] <-- sums[i] \ num_participants;
-        avg_remainder[i] <-- sums[i] % num_participants;
-
-        avg[i] * num_participants + avg_remainder[i] === sums[i];
-
-        avg_lt[i] = LessThan(SHA256_DIGEST_SIZE());
-        avg_lt[i].in[0] <== avg_remainder[i];
-        avg_lt[i].in[1] <== num_participants;
-        avg_lt[i].out === 1;
-    }
-
-    signal result_valid[dim];
-    component result_eq[dim];
-    for (var i = 0; i < dim; i++) {
-        result_eq[i] = SafeIsEqual();
-        result_eq[i].a <== avg[i];
-        result_eq[i].b <== aggregated_result[i];
-        result_valid[i] <== result_eq[i].out;
-    }
-
-    signal all_commits[num_participants + 1];
-    all_commits[0] <== 1;
-    for (var p = 0; p < num_participants; p++) {
-        all_commits[p + 1] <== all_commits[p] * commit_valid[p];
-    }
-
-    signal all_results[dim + 1];
-    all_results[0] <== 1;
-    for (var i = 0; i < dim; i++) {
-        all_results[i + 1] <== all_results[i] * result_valid[i];
-    }
-
-    valid <== all_commits[num_participants] * all_results[dim] * threshold_check.out;
-}
-
 template FullInferenceProof(num_layers, dim, precision_bits) {
     signal input tokens[dim];
-    signal input layer_weights_s[num_layers][dim][dim];
-    signal input layer_weights_t[num_layers][dim][dim];
+    signal input layer_weights_s[num_layers][dim \ 2][dim \ 2];
+    signal input layer_weights_t[num_layers][dim \ 2][dim \ 2];
+    signal input layer_bias_s[num_layers][dim \ 2];
+    signal input layer_bias_t[num_layers][dim \ 2];
     signal input expected_output[dim];
     signal input input_commitment;
     signal input output_commitment;
     signal input layer_commitments[num_layers];
     signal input max_error_squared;
     signal output is_valid;
+
+    var half = dim \ 2;
 
     signal layer_outputs[num_layers + 1][dim];
     for (var i = 0; i < dim; i++) {
@@ -705,10 +334,15 @@ template FullInferenceProof(num_layers, dim, precision_bits) {
 
         for (var i = 0; i < dim; i++) {
             rsf_layers[layer].x[i] <== layer_outputs[layer][i];
-            for (var j = 0; j < dim; j++) {
+        }
+
+        for (var i = 0; i < half; i++) {
+            for (var j = 0; j < half; j++) {
                 rsf_layers[layer].weights_s[i][j] <== layer_weights_s[layer][i][j];
                 rsf_layers[layer].weights_t[i][j] <== layer_weights_t[layer][i][j];
             }
+            rsf_layers[layer].bias_s[i] <== layer_bias_s[layer][i];
+            rsf_layers[layer].bias_t[i] <== layer_bias_t[layer][i];
         }
 
         rsf_layers[layer].expected_commitment <== layer_commitments[layer];
@@ -729,11 +363,15 @@ template FullInferenceProof(num_layers, dim, precision_bits) {
     output_check.a <== output_hash.out;
     output_check.b <== output_commitment;
 
+    signal diff[dim];
     signal diff_squared[dim];
+    component diff_abs[dim];
+
     for (var i = 0; i < dim; i++) {
-        signal diff;
-        diff <== layer_outputs[num_layers][i] - expected_output[i];
-        diff_squared[i] <== diff * diff;
+        diff[i] <== layer_outputs[num_layers][i] - expected_output[i];
+        diff_abs[i] = SignedAbs(precision_bits \ 2);
+        diff_abs[i].in <== diff[i];
+        diff_squared[i] <== diff_abs[i].out * diff_abs[i].out;
     }
 
     signal error_sum[dim + 1];
@@ -741,6 +379,12 @@ template FullInferenceProof(num_layers, dim, precision_bits) {
     for (var i = 0; i < dim; i++) {
         error_sum[i + 1] <== error_sum[i] + diff_squared[i];
     }
+
+    component error_range = Num2Bits(precision_bits);
+    error_range.in <== error_sum[dim];
+
+    component max_err_range = Num2Bits(precision_bits);
+    max_err_range.in <== max_error_squared;
 
     component error_check = LessThan(precision_bits);
     error_check.in[0] <== error_sum[dim];
@@ -758,66 +402,11 @@ template FullInferenceProof(num_layers, dim, precision_bits) {
     signal v2;
     v2 <== v1 * error_check.out;
 
-    is_valid <== v2 * all_layers_valid[num_layers];
-}
+    signal v3;
+    v3 <== v2 * all_layers_valid[num_layers];
 
-template InferenceTraceWithBatch(num_layers, dim, batch_size, precision_bits) {
-    signal input tokens[batch_size][dim];
-    signal input layer_weights_s[num_layers][dim][dim];
-    signal input layer_weights_t[num_layers][dim][dim];
-    signal input expected_outputs[batch_size][dim];
-    signal input input_commitments[batch_size];
-    signal input output_commitments[batch_size];
-    signal input layer_commitments[num_layers];
-    signal input max_error_squared;
-    signal input batch_root;
-    signal output is_valid;
-
-    component inference_proofs[batch_size];
-    signal batch_valid[batch_size];
-
-    for (var b = 0; b < batch_size; b++) {
-        inference_proofs[b] = FullInferenceProof(num_layers, dim, precision_bits);
-
-        for (var i = 0; i < dim; i++) {
-            inference_proofs[b].tokens[i] <== tokens[b][i];
-            inference_proofs[b].expected_output[i] <== expected_outputs[b][i];
-        }
-
-        for (var layer = 0; layer < num_layers; layer++) {
-            for (var i = 0; i < dim; i++) {
-                for (var j = 0; j < dim; j++) {
-                    inference_proofs[b].layer_weights_s[layer][i][j] <== layer_weights_s[layer][i][j];
-                    inference_proofs[b].layer_weights_t[layer][i][j] <== layer_weights_t[layer][i][j];
-                }
-            }
-            inference_proofs[b].layer_commitments[layer] <== layer_commitments[layer];
-        }
-
-        inference_proofs[b].input_commitment <== input_commitments[b];
-        inference_proofs[b].output_commitment <== output_commitments[b];
-        inference_proofs[b].max_error_squared <== max_error_squared;
-
-        batch_valid[b] <== inference_proofs[b].is_valid;
-    }
-
-    component batch_verify = VerifyBatchInference(batch_size, dim);
-    for (var b = 0; b < batch_size; b++) {
-        for (var i = 0; i < dim; i++) {
-            batch_verify.inputs[b][i] <== tokens[b][i];
-            batch_verify.outputs[b][i] <== expected_outputs[b][i];
-        }
-        batch_verify.commitments[b] <== output_commitments[b];
-    }
-    batch_verify.expected_root <== batch_root;
-
-    signal all_batch_valid[batch_size + 1];
-    all_batch_valid[0] <== 1;
-    for (var b = 0; b < batch_size; b++) {
-        all_batch_valid[b + 1] <== all_batch_valid[b] * batch_valid[b];
-    }
-
-    is_valid <== all_batch_valid[batch_size] * batch_verify.valid;
+    is_valid <== v3;
+    is_valid * (is_valid - 1) === 0;
 }
 
 component main {public [tokens, expected_output, input_commitment, output_commitment]} = FullInferenceProof(8, 32, 64);
