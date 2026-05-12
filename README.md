@@ -1,4 +1,4 @@
-Update: The formal verification of rsf.zig is complete and can be found at: src/verification/lean4/rsf.lean
+Update: The formal verification of rsf.zig is complete with 21110 lines and can be found at: src/verification/lean4/rsf.lean
 
 ## JAIDE áttekintés
 
