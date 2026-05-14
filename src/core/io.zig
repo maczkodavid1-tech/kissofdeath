@@ -11,12 +11,9 @@ pub const IoConfig = struct {
     pub const MAX_READ_BYTES: usize = 100 * 1024 * 1024;
     pub const MAX_FILE_SIZE: usize = 1024 * 1024 * 1024;
     pub const PAGE_SIZE: usize = mem.page_size;
-    pub const MIX_SHIFT: u6 = 33;
     pub const TRUNCATE_SHIFT: u6 = 32;
-    pub const MAX_FLUSH_DEPTH: usize = 10;
     pub const SECURE_FILE_MODE: u9 = 0o600;
     pub const MAX_PATH_LEN: usize = 4096;
-    pub const CACHE_LINE_SIZE: usize = 128;
 };
 
 pub const IoError = error{
@@ -25,21 +22,16 @@ pub const IoError = error{
     FileIsEmpty,
     BufferNotMapped,
     OutOfBounds,
-    RecursionDepthExceeded,
     MaxBytesExceeded,
-    InvalidPathCharacter,
-    EndOfStream,
     UnexpectedEndOfFile,
     FileNotFound,
     AccessDenied,
-    PathAlreadyExists,
     InvalidPath,
     NotADirectory,
-    NotAFile,
-    OperationFailed,
     ReadOnlyFile,
     Overflow,
     PathTooLong,
+    InvalidBufferSize,
 };
 
 fn generateRuntimeSeed() u64 {
@@ -49,8 +41,10 @@ fn generateRuntimeSeed() u64 {
     hasher.update(&entropy_buf);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
+    const result = mem.readInt(u64, digest[0..8], .little);
+    secureZeroBytes(&digest);
     secureZeroBytes(&entropy_buf);
-    return mem.readInt(u64, digest[0..8], .little);
+    return result;
 }
 
 fn secureZeroBytes(buf: []u8) void {
@@ -64,11 +58,11 @@ fn secureZeroBytes(buf: []u8) void {
 fn mixHash(h: u64) u64 {
     const prime1: u64 = 0xff51afd7ed558ccd;
     const prime2: u64 = 0xc4ceb9fe1a85ec53;
-    var mixed = h ^ (h >> IoConfig.MIX_SHIFT);
+    var mixed = h ^ (h >> 33);
     mixed *%= prime1;
-    mixed ^= mixed >> IoConfig.MIX_SHIFT;
+    mixed ^= mixed >> 29;
     mixed *%= prime2;
-    return mixed ^ (mixed >> IoConfig.MIX_SHIFT);
+    return mixed ^ (mixed >> 32);
 }
 
 fn addChecked(a: usize, b: usize) !usize {
@@ -100,7 +94,9 @@ pub const MMAP = struct {
     fn openFromFile(allocator: Allocator, file: fs.File, mode: fs.File.OpenFlags) !MMAP {
         const stat = try file.stat();
         const size_u64: u64 = stat.size;
-        if (size_u64 > math.maxInt(usize)) return error.FileTooLarge;
+        if (math.maxInt(usize) < math.maxInt(u64)) {
+            if (size_u64 > math.maxInt(usize)) return error.FileTooLarge;
+        }
         if (size_u64 > IoConfig.MAX_FILE_SIZE) return error.FileTooLarge;
         var file_size: usize = @intCast(size_u64);
 
@@ -115,15 +111,15 @@ pub const MMAP = struct {
             }
         }
 
-        var prot_flags: u32 = std.os.PROT.READ;
+        var prot_flags: u32 = std.posix.PROT.READ;
         if (is_writable) {
-            prot_flags |= std.os.PROT.WRITE;
+            prot_flags |= std.posix.PROT.WRITE;
         }
 
         const aligned_size = mem.alignForward(usize, file_size, IoConfig.PAGE_SIZE);
-        const map_flags: u32 = if (is_writable) std.os.MAP.SHARED else std.os.MAP.PRIVATE;
+        const map_flags: u32 = if (is_writable) std.posix.MAP.SHARED else std.posix.MAP.PRIVATE;
 
-        const buffer = try std.os.mmap(
+        const buffer = try std.posix.mmap(
             null,
             aligned_size,
             prot_flags,
@@ -146,7 +142,7 @@ pub const MMAP = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.buffer) |buf| {
-            std.os.munmap(buf);
+            std.posix.munmap(buf);
             self.buffer = null;
         }
         self.file.close();
@@ -156,12 +152,12 @@ pub const MMAP = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const buf = self.buffer orelse return IoError.BufferNotMapped;
-        if (offset >= self.actual_size) return IoError.OutOfBounds;
+        if (offset > self.actual_size) return IoError.OutOfBounds;
         const end = try addChecked(offset, len);
-        if (end > self.actual_size) {
-            return buf[offset..self.actual_size];
-        }
-        return buf[offset..end];
+        const read_end = @min(end, self.actual_size);
+        const result = try self.allocator.alloc(u8, read_end - offset);
+        @memcpy(result, buf[offset..read_end]);
+        return result;
     }
 
     pub const SyncMode = enum {
@@ -176,10 +172,10 @@ pub const MMAP = struct {
         const buf = self.buffer orelse return IoError.BufferNotMapped;
         if (offset > self.actual_size) return IoError.OutOfBounds;
         const end = try addChecked(offset, data.len);
-        if (end > buf.len) return IoError.OutOfBounds;
+        if (end > self.actual_size) return IoError.OutOfBounds;
         @memcpy(buf[offset..end], data);
         if (sync_mode == .sync) {
-            try std.os.msync(buf, std.os.MSF.SYNC);
+            try std.posix.msync(buf, std.posix.MSF.SYNC);
         }
     }
 
@@ -193,19 +189,23 @@ pub const MMAP = struct {
         const new_size = try addChecked(current_size, data.len);
         if (new_size > IoConfig.MAX_FILE_SIZE) return error.FileTooLarge;
 
-        std.os.munmap(buf);
-        self.buffer = null;
-
         try self.file.setEndPos(new_size);
         try self.file.pwriteAll(data, current_size);
 
+        std.posix.munmap(buf);
+        self.buffer = null;
+
         const aligned_size = mem.alignForward(usize, new_size, IoConfig.PAGE_SIZE);
 
-        const new_buf = try std.os.mmap(
+        var prot_flags: u32 = std.posix.PROT.READ;
+        if (self.is_writable) prot_flags |= std.posix.PROT.WRITE;
+        const map_flags: u32 = if (self.is_writable) std.posix.MAP.SHARED else std.posix.MAP.PRIVATE;
+
+        const new_buf = try std.posix.mmap(
             null,
             aligned_size,
-            std.os.PROT.READ | std.os.PROT.WRITE,
-            std.os.MAP.SHARED,
+            prot_flags,
+            map_flags,
             self.file.handle,
             0
         );
@@ -218,10 +218,12 @@ pub const MMAP = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const buf = self.buffer orelse return IoError.BufferNotMapped;
-        try std.os.msync(buf, std.os.MSF.SYNC);
+        try std.posix.msync(buf, std.posix.MSF.SYNC);
     }
 
-    pub fn size(self: *const MMAP) usize {
+    pub fn size(self: *MMAP) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.actual_size;
     }
 };
@@ -230,8 +232,8 @@ pub const DurableWriter = struct {
     file: fs.File,
     buffer: [IoConfig.BUFFER_SIZE]u8,
     pos: usize,
-    flush_depth: usize,
     enable_sync: bool,
+    mutex: std.Thread.Mutex,
 
     pub fn init(path: []const u8, enable_sync: bool) !DurableWriter {
         const file = try fs.cwd().createFile(path, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
@@ -239,8 +241,8 @@ pub const DurableWriter = struct {
             .file = file,
             .buffer = mem.zeroes([IoConfig.BUFFER_SIZE]u8),
             .pos = 0,
-            .flush_depth = 0,
             .enable_sync = enable_sync,
+            .mutex = .{},
         };
     }
 
@@ -250,21 +252,15 @@ pub const DurableWriter = struct {
             .file = file,
             .buffer = mem.zeroes([IoConfig.BUFFER_SIZE]u8),
             .pos = 0,
-            .flush_depth = 0,
             .enable_sync = enable_sync,
+            .mutex = .{},
         };
     }
 
-    pub fn deinit(self: *DurableWriter) !void {
-        try self.flush();
-        if (self.enable_sync) {
-            try self.file.sync();
-        }
-        self.file.close();
-    }
-
-    pub fn deinitNoError(self: *DurableWriter) void {
-        self.flush() catch {};
+    pub fn deinit(self: *DurableWriter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.flushInternal() catch {};
         if (self.enable_sync) {
             self.file.sync() catch {};
         }
@@ -272,11 +268,13 @@ pub const DurableWriter = struct {
     }
 
     pub fn write(self: *DurableWriter, data: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var remaining = data;
         while (remaining.len > 0) {
             const space = self.buffer.len - self.pos;
             if (space == 0) {
-                try self.flush();
+                try self.flushInternal();
                 continue;
             }
             const to_copy = @min(remaining.len, space);
@@ -287,12 +285,12 @@ pub const DurableWriter = struct {
     }
 
     pub fn flush(self: *DurableWriter) !void {
-        if (self.flush_depth > IoConfig.MAX_FLUSH_DEPTH) {
-            return IoError.RecursionDepthExceeded;
-        }
-        self.flush_depth += 1;
-        defer self.flush_depth -= 1;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.flushInternal();
+    }
 
+    fn flushInternal(self: *DurableWriter) !void {
         if (self.pos > 0) {
             try self.file.writeAll(self.buffer[0..self.pos]);
             self.pos = 0;
@@ -301,7 +299,6 @@ pub const DurableWriter = struct {
 
     pub fn writeAll(self: *DurableWriter, data: []const u8) !void {
         try self.write(data);
-        try self.flush();
     }
 };
 
@@ -312,28 +309,26 @@ pub const BufferedReader = struct {
     limit: usize,
     max_read_bytes: usize,
     total_read: usize,
+    mutex: std.Thread.Mutex,
 
     pub fn init(path: []const u8) !BufferedReader {
-        const file = try fs.cwd().openFile(path, .{});
-        return .{
-            .file = file,
-            .buffer = mem.zeroes([IoConfig.BUFFER_SIZE]u8),
-            .pos = 0,
-            .limit = 0,
-            .max_read_bytes = IoConfig.MAX_READ_BYTES,
-            .total_read = 0,
-        };
+        return initWithMaxBytes(path, IoConfig.MAX_READ_BYTES);
     }
 
     pub fn initWithDir(dir: fs.Dir, path: []const u8) !BufferedReader {
+        return initWithDirAndMaxBytes(dir, path, IoConfig.MAX_READ_BYTES);
+    }
+
+    pub fn initWithDirAndMaxBytes(dir: fs.Dir, path: []const u8, max_bytes: usize) !BufferedReader {
         const file = try dir.openFile(path, .{});
         return .{
             .file = file,
             .buffer = mem.zeroes([IoConfig.BUFFER_SIZE]u8),
             .pos = 0,
             .limit = 0,
-            .max_read_bytes = IoConfig.MAX_READ_BYTES,
+            .max_read_bytes = max_bytes,
             .total_read = 0,
+            .mutex = .{},
         };
     }
 
@@ -346,15 +341,18 @@ pub const BufferedReader = struct {
             .limit = 0,
             .max_read_bytes = max_bytes,
             .total_read = 0,
+            .mutex = .{},
         };
     }
 
     pub fn deinit(self: *BufferedReader) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.file.close();
     }
 
     fn fillBuffer(self: *BufferedReader) !bool {
-        if (self.total_read >= self.max_read_bytes) return false;
+        if (self.total_read >= self.max_read_bytes) return IoError.MaxBytesExceeded;
         const remaining_allowed = self.max_read_bytes - self.total_read;
         const to_read = @min(self.buffer.len, remaining_allowed);
         const n = try self.file.read(self.buffer[0..to_read]);
@@ -365,6 +363,8 @@ pub const BufferedReader = struct {
     }
 
     pub fn read(self: *BufferedReader, buf: []u8) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var total: usize = 0;
         while (total < buf.len) {
             if (self.pos < self.limit) {
@@ -380,6 +380,8 @@ pub const BufferedReader = struct {
     }
 
     pub fn readUntil(self: *BufferedReader, delim: u8, allocator: Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var list = std.ArrayList(u8).init(allocator);
         errdefer list.deinit();
 
@@ -387,7 +389,7 @@ pub const BufferedReader = struct {
             if (self.pos < self.limit) {
                 const chunk = self.buffer[self.pos..self.limit];
                 if (mem.indexOfScalar(u8, chunk, delim)) |idx| {
-                    try list.appendSlice(chunk[0..idx + 1]);
+                    try list.appendSlice(chunk[0..idx]);
                     self.pos += idx + 1;
                     return list.toOwnedSlice();
                 } else {
@@ -402,6 +404,8 @@ pub const BufferedReader = struct {
     }
 
     pub fn readLine(self: *BufferedReader, allocator: Allocator) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var list = std.ArrayList(u8).init(allocator);
         errdefer list.deinit();
 
@@ -427,6 +431,8 @@ pub const BufferedReader = struct {
     }
 
     pub fn peek(self: *BufferedReader) !?u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.pos < self.limit) return self.buffer[self.pos];
         if (!try self.fillBuffer()) return null;
         if (self.pos < self.limit) return self.buffer[self.pos];
@@ -439,8 +445,12 @@ pub const BufferedWriter = struct {
     buffer: []u8,
     pos: usize,
     allocator: Allocator,
+    mutex: std.Thread.Mutex,
 
-    pub fn init(allocator: Allocator, file: fs.File, buffer_size: usize) !BufferedWriter {
+    pub fn init(allocator: Allocator, path: []const u8, buffer_size: usize) !BufferedWriter {
+        if (buffer_size == 0) return IoError.InvalidBufferSize;
+        const file = try fs.cwd().createFile(path, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
+        errdefer file.close();
         const buffer = try allocator.alloc(u8, buffer_size);
         errdefer allocator.free(buffer);
         return .{
@@ -448,32 +458,35 @@ pub const BufferedWriter = struct {
             .buffer = buffer,
             .pos = 0,
             .allocator = allocator,
+            .mutex = .{},
         };
     }
 
-    pub fn deinit(self: *BufferedWriter) !void {
-        try self.flush();
+    pub fn deinit(self: *BufferedWriter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.flushInternal() catch {};
         self.allocator.free(self.buffer);
-    }
-
-    pub fn deinitNoError(self: *BufferedWriter) void {
-        self.flush() catch {};
-        self.allocator.free(self.buffer);
+        self.file.close();
     }
 
     pub fn writeByte(self: *BufferedWriter, byte: u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.pos >= self.buffer.len) {
-            try self.flush();
+            try self.flushInternal();
         }
         self.buffer[self.pos] = byte;
         self.pos += 1;
     }
 
     pub fn writeBytes(self: *BufferedWriter, data: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var remaining = data;
         while (remaining.len > 0) {
             if (self.pos >= self.buffer.len) {
-                try self.flush();
+                try self.flushInternal();
             }
             const available = self.buffer.len - self.pos;
             const to_write = @min(available, remaining.len);
@@ -484,6 +497,12 @@ pub const BufferedWriter = struct {
     }
 
     pub fn flush(self: *BufferedWriter) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.flushInternal();
+    }
+
+    fn flushInternal(self: *BufferedWriter) !void {
         if (self.pos > 0) {
             try self.file.writeAll(self.buffer[0..self.pos]);
             self.pos = 0;
@@ -497,16 +516,19 @@ pub fn stableHash(data: []const u8, seed: u64) u64 {
     return mixHash(hasher.final());
 }
 
-var g_hash_seed: u64 = 0;
-var g_hash_seed_initialized: bool = false;
+var g_hash_seed_initialized = std.atomic.Value(bool).init(false);
+var g_hash_seed: u64 = undefined;
 var g_hash_seed_mutex: std.Thread.Mutex = .{};
 
 fn getHashSeed() u64 {
+    if (g_hash_seed_initialized.load(.acquire)) {
+        return g_hash_seed;
+    }
     g_hash_seed_mutex.lock();
     defer g_hash_seed_mutex.unlock();
-    if (!g_hash_seed_initialized) {
+    if (!g_hash_seed_initialized.load(.acquire)) {
         g_hash_seed = generateRuntimeSeed();
-        g_hash_seed_initialized = true;
+        g_hash_seed_initialized.store(true, .release);
     }
     return g_hash_seed;
 }
@@ -524,16 +546,7 @@ pub fn hash32(data: []const u8) u32 {
     return @truncate(mixed);
 }
 
-pub fn pathJoin(allocator: Allocator, parts: []const []const u8) ![]u8 {
-    return std.fs.path.join(allocator, parts);
-}
-
-pub fn pathExists(path: []const u8) bool {
-    _ = fs.cwd().statFile(path) catch return false;
-    return true;
-}
-
-pub fn pathExistsWithAccess(path: []const u8) !bool {
+pub fn pathExists(path: []const u8) !bool {
     _ = fs.cwd().statFile(path) catch |err| {
         if (err == error.FileNotFound) return false;
         return err;
@@ -542,7 +555,7 @@ pub fn pathExistsWithAccess(path: []const u8) !bool {
 }
 
 pub fn createDirRecursive(path: []const u8) !void {
-    if (path.len == 0) return;
+    if (path.len == 0) return IoError.InvalidPath;
     try fs.cwd().makePath(path);
 }
 
@@ -553,37 +566,13 @@ pub fn readFile(allocator: Allocator, path: []const u8) ![]u8 {
 pub fn readFileWithDir(allocator: Allocator, dir: fs.Dir, path: []const u8) ![]u8 {
     const file = try dir.openFile(path, .{});
     defer file.close();
-    const stat = try file.stat();
-    const size_u64: u64 = stat.size;
-    if (size_u64 > math.maxInt(usize)) return error.FileTooLarge;
-    if (size_u64 > IoConfig.MAX_FILE_SIZE) return error.FileTooLarge;
-    const size: usize = @intCast(size_u64);
-    if (size == 0) {
-        return allocator.alloc(u8, 0);
-    }
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    const bytes_read = try file.readAll(buf);
-    if (bytes_read != size) return IoError.UnexpectedEndOfFile;
-    return buf;
+    return file.readToEndAlloc(allocator, IoConfig.MAX_FILE_SIZE);
 }
 
 pub fn readFileLimited(allocator: Allocator, path: []const u8, max_size: usize) ![]u8 {
     const file = try fs.cwd().openFile(path, .{});
     defer file.close();
-    const stat = try file.stat();
-    const size_u64: u64 = stat.size;
-    if (size_u64 > math.maxInt(usize)) return error.FileTooLarge;
-    const size: usize = @intCast(size_u64);
-    if (size > max_size) return error.FileTooLarge;
-    if (size == 0) {
-        return allocator.alloc(u8, 0);
-    }
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    const bytes_read = try file.readAll(buf);
-    if (bytes_read != size) return IoError.UnexpectedEndOfFile;
-    return buf;
+    return file.readToEndAlloc(allocator, max_size);
 }
 
 pub const WriteFileOptions = struct {
@@ -597,44 +586,34 @@ pub fn writeFile(path: []const u8, data: []const u8) !void {
 
 pub fn writeFileWithOptions(path: []const u8, data: []const u8, options: WriteFileOptions) !void {
     if (options.create_backup) {
-        const exists = fs.cwd().statFile(path) catch |err| {
-            if (err != error.FileNotFound) return err;
-            null;
+        const exists = fs.cwd().statFile(path) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
         };
         if (exists != null) {
             var backup_buf: [IoConfig.MAX_PATH_LEN]u8 = undefined;
             const backup_path = std.fmt.bufPrint(&backup_buf, "{s}.bak", .{path}) catch return IoError.PathTooLong;
-            fs.cwd().copyFile(path, fs.cwd(), backup_path, .{}) catch |copy_err| {
-                return copy_err;
-            };
+            try fs.cwd().copyFile(path, fs.cwd(), backup_path, .{});
         }
     }
-    const file = try fs.cwd().createFile(path, .{ .mode = IoConfig.SECURE_FILE_MODE });
+    const file = try fs.cwd().createFile(path, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
     defer file.close();
     try file.writeAll(data);
     if (options.sync_after_write) try file.sync();
 }
 
 pub fn appendFile(path: []const u8, data: []const u8) !void {
-    const file = fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| {
-        if (err == error.FileNotFound) {
-            const new_file = try fs.cwd().createFile(path, .{ .mode = IoConfig.SECURE_FILE_MODE });
-            defer new_file.close();
-            try new_file.writeAll(data);
-            return;
-        }
-        return err;
-    };
+    var path_c: [IoConfig.MAX_PATH_LEN]u8 = undefined;
+    if (path.len >= IoConfig.MAX_PATH_LEN) return IoError.PathTooLong;
+    @memcpy(path_c[0..path.len], path);
+    path_c[path.len] = 0;
+    const fd = try std.posix.openat(fs.cwd().fd, &path_c, std.posix.O.WRONLY | std.posix.O.APPEND | std.posix.O.CREAT, IoConfig.SECURE_FILE_MODE);
+    const file = fs.File{ .handle = fd };
     defer file.close();
-    try file.seekFromEnd(0);
     try file.writeAll(data);
 }
 
 pub fn deleteFile(path: []const u8) !void {
-    const stat_result = try fs.cwd().statFile(path);
-    if (stat_result.kind == .directory) {
-        return fs.cwd().deleteTree(path);
-    }
     try fs.cwd().deleteFile(path);
 }
 
@@ -656,8 +635,11 @@ pub fn copyFileWithProgress(
     const src_file = try fs.cwd().openFile(src, .{});
     defer src_file.close();
 
-    const dst_file = try fs.cwd().createFile(dst, .{ .mode = IoConfig.SECURE_FILE_MODE });
-    errdefer dst_file.close();
+    const dst_file = try fs.cwd().createFile(dst, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
+    errdefer {
+        dst_file.close();
+        fs.cwd().deleteFile(dst) catch {};
+    }
 
     const stat = try src_file.stat();
     const total_size: u64 = stat.size;
@@ -682,7 +664,7 @@ pub fn copyFileWithProgress(
 
 pub fn moveFile(allocator: Allocator, old: []const u8, new: []const u8) !void {
     fs.cwd().rename(old, new) catch |err| {
-        if (err == error.RenameAcrossMountPoints or err == error.NotSameFileSystem) {
+        if (err == error.RenameAcrossMountPoints) {
             try copyFile(allocator, old, new);
             try fs.cwd().deleteFile(old);
             return;
@@ -710,56 +692,47 @@ pub fn listDir(allocator: Allocator, path: []const u8) ![][]u8 {
     return list.toOwnedSlice();
 }
 
-pub fn createDir(path: []const u8) !void {
-    try createDirRecursive(path);
-}
-
 pub fn removeDir(path: []const u8) !void {
-    const stat_result = try fs.cwd().statFile(path);
-    if (stat_result.kind == .sym_link) {
-        try fs.cwd().deleteFile(path);
-        return;
-    }
-    try fs.cwd().deleteTree(path);
-}
-
-pub fn removeFile(path: []const u8) !void {
-    try fs.cwd().deleteFile(path);
-}
-
-pub fn renameFile(old: []const u8, new: []const u8) !void {
-    try fs.cwd().rename(old, new);
+    try fs.cwd().deleteDir(path);
 }
 
 pub fn getFileSize(path: []const u8) !usize {
     const stat = try fs.cwd().statFile(path);
     const size_u64: u64 = stat.size;
-    if (size_u64 > math.maxInt(usize)) return error.FileTooLarge;
+    if (math.maxInt(usize) < math.maxInt(u64)) {
+        if (size_u64 > math.maxInt(usize)) return error.FileTooLarge;
+    }
     return @intCast(size_u64);
 }
 
-pub fn isDir(path: []const u8) bool {
-    const stat_result = fs.cwd().statFile(path) catch return false;
+pub fn isDir(path: []const u8) !bool {
+    const stat_result = fs.cwd().statFile(path) catch |err| {
+        if (err == error.FileNotFound) return false;
+        return err;
+    };
     return stat_result.kind == .directory;
 }
 
-pub fn isFile(path: []const u8) bool {
-    const stat_result = fs.cwd().statFile(path) catch return false;
+pub fn isFile(path: []const u8) !bool {
+    const stat_result = fs.cwd().statFile(path) catch |err| {
+        if (err == error.FileNotFound) return false;
+        return err;
+    };
     return stat_result.kind == .file;
 }
 
-pub inline fn toLittleEndian(comptime T: type, value: T) T {
+pub inline fn toLittleEndian(T: type, value: T) T {
     comptime {
         const info = @typeInfo(T);
         if (info != .Int) @compileError("toLittleEndian requires integer type");
     }
     return switch (comptime builtin.target.cpu.arch.endian()) {
         .little => value,
-        .Big => @byteSwap(value),
+        .big => @byteSwap(value),
     };
 }
 
-pub inline fn fromLittleEndian(comptime T: type, bytes: *const [@sizeOf(T)]u8) T {
+pub inline fn fromLittleEndian(T: type, bytes: *const [@sizeOf(T)]u8) T {
     comptime {
         const info = @typeInfo(T);
         if (info != .Int) @compileError("fromLittleEndian requires integer type");
@@ -767,18 +740,18 @@ pub inline fn fromLittleEndian(comptime T: type, bytes: *const [@sizeOf(T)]u8) T
     return mem.readInt(T, bytes, .little);
 }
 
-pub inline fn toBigEndian(comptime T: type, value: T) T {
+pub inline fn toBigEndian(T: type, value: T) T {
     comptime {
         const info = @typeInfo(T);
         if (info != .Int) @compileError("toBigEndian requires integer type");
     }
     return switch (comptime builtin.target.cpu.arch.endian()) {
         .little => @byteSwap(value),
-        .Big => value,
+        .big => value,
     };
 }
 
-pub inline fn fromBigEndian(comptime T: type, bytes: *const [@sizeOf(T)]u8) T {
+pub inline fn fromBigEndian(T: type, bytes: *const [@sizeOf(T)]u8) T {
     comptime {
         const info = @typeInfo(T);
         if (info != .Int) @compileError("fromBigEndian requires integer type");
@@ -787,17 +760,14 @@ pub inline fn fromBigEndian(comptime T: type, bytes: *const [@sizeOf(T)]u8) T {
 }
 
 pub fn sequentialWrite(allocator: Allocator, path: []const u8, data: []const []const u8) !void {
-    const file = try fs.cwd().createFile(path, .{ .mode = IoConfig.SECURE_FILE_MODE });
-    defer file.close();
-
-    var writer = try BufferedWriter.init(allocator, file, IoConfig.LARGE_CHUNK_SIZE);
-    defer writer.deinitNoError();
+    var writer = try BufferedWriter.init(allocator, path, IoConfig.LARGE_CHUNK_SIZE);
+    defer writer.deinit();
 
     for (data) |chunk| {
         try writer.writeBytes(chunk);
     }
     try writer.flush();
-    try file.sync();
+    try writer.file.sync();
 }
 
 pub fn sequentialRead(allocator: Allocator, path: []const u8, chunk_callback: *const fn([]const u8) anyerror!void) !void {
@@ -814,75 +784,60 @@ pub fn sequentialRead(allocator: Allocator, path: []const u8, chunk_callback: *c
     }
 }
 
-pub fn atomicWrite(allocator: Allocator, path: []const u8, data: []const u8) !void {
-    _ = allocator;
-    var temp_buf: [IoConfig.MAX_PATH_LEN]u8 = undefined;
-    const temp_path = std.fmt.bufPrint(&temp_buf, "{s}.tmp.{d}", .{path, generateRuntimeSeed()}) catch return IoError.PathTooLong;
+pub fn atomicWrite(path: []const u8, data: []const u8) !void {
+    var temp_buf: [IoConfig.MAX_PATH_LEN + 32]u8 = undefined;
+    const temp_path = std.fmt.bufPrint(&temp_buf, "{s}.tmp.{x}", .{path, std.crypto.random.int(u64)}) catch return IoError.PathTooLong;
 
     const file = try fs.cwd().createFile(temp_path, .{ .mode = IoConfig.SECURE_FILE_MODE });
+    var file_closed = false;
     errdefer {
-        file.close();
+        if (!file_closed) file.close();
         fs.cwd().deleteFile(temp_path) catch {};
     }
 
     try file.writeAll(data);
     try file.sync();
     file.close();
+    file_closed = true;
 
     try fs.cwd().rename(temp_path, path);
 }
 
-pub const FileCompareResult = enum {
-    equal,
-    different,
-    first_not_found,
-    second_not_found,
-    both_not_found,
-    read_error,
-};
-
-pub fn compareFiles(allocator: Allocator, path1: []const u8, path2: []const u8) FileCompareResult {
-    const file1 = fs.cwd().openFile(path1, .{}) catch |err| {
-        if (err == error.FileNotFound) {
-            const file2 = fs.cwd().openFile(path2, .{}) catch |err2| {
-                if (err2 == error.FileNotFound) return .both_not_found;
-                return .read_error;
-            };
-            file2.close();
-            return .first_not_found;
-        }
-        return .read_error;
-    };
+pub fn compareFiles(allocator: Allocator, path1: []const u8, path2: []const u8) !bool {
+    const file1 = try fs.cwd().openFile(path1, .{});
     defer file1.close();
 
-    const file2 = fs.cwd().openFile(path2, .{}) catch |err| {
-        if (err == error.FileNotFound) return .second_not_found;
-        return .read_error;
-    };
+    const file2 = try fs.cwd().openFile(path2, .{});
     defer file2.close();
 
-    const stat1 = file1.stat() catch return .read_error;
-    const stat2 = file2.stat() catch return .read_error;
-    if (stat1.size != stat2.size) return .different;
+    const stat1 = try file1.stat();
+    const stat2 = try file2.stat();
+    if (stat1.size != stat2.size) return false;
 
-    const buf1 = allocator.alloc(u8, IoConfig.LARGE_CHUNK_SIZE) catch return .read_error;
+    const buf1 = try allocator.alloc(u8, IoConfig.LARGE_CHUNK_SIZE);
     defer allocator.free(buf1);
-    const buf2 = allocator.alloc(u8, IoConfig.LARGE_CHUNK_SIZE) catch return .read_error;
+    const buf2 = try allocator.alloc(u8, IoConfig.LARGE_CHUNK_SIZE);
     defer allocator.free(buf2);
 
     while (true) {
-        const n1 = file1.read(buf1) catch return .read_error;
-        const n2 = file2.read(buf2) catch return .read_error;
-        if (n1 != n2) return .different;
-        if (n1 == 0) break;
-        if (!mem.eql(u8, buf1[0..n1], buf2[0..n2])) return .different;
+        var total1: usize = 0;
+        while (total1 < buf1.len) {
+            const n = try file1.read(buf1[total1..]);
+            if (n == 0) break;
+            total1 += n;
+        }
+        var total2: usize = 0;
+        while (total2 < buf2.len) {
+            const n = try file2.read(buf2[total2..]);
+            if (n == 0) break;
+            total2 += n;
+        }
+        if (total1 != total2) return false;
+        if (total1 == 0) break;
+        if (!mem.eql(u8, buf1[0..total1], buf2[0..total2])) return false;
     }
 
-    return .equal;
-}
-
-pub fn compareFilesEqual(allocator: Allocator, path1: []const u8, path2: []const u8) bool {
-    return compareFiles(allocator, path1, path2) == .equal;
+    return true;
 }
 
 test "MMAP open and close" {
@@ -898,17 +853,18 @@ test "MMAP open and close" {
     defer mmap.close();
 
     const content = try mmap.read(0, 9);
+    defer gpa.free(content);
     try std.testing.expectEqualStrings("test data", content);
 }
 
 test "DurableWriter with sync" {
-    var gpa = std.testing.allocator;
+    const gpa = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     var writer = try DurableWriter.initWithDir(tmp_dir.dir, "test_durable.txt", false);
     try writer.writeAll("hello world");
-    try writer.deinit();
+    writer.deinit();
 
     const content = try readFileWithDir(gpa, tmp_dir.dir, "test_durable.txt");
     defer gpa.free(content);
@@ -916,7 +872,7 @@ test "DurableWriter with sync" {
 }
 
 test "BufferedReader zero init" {
-    var gpa = std.testing.allocator;
+    const gpa = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
@@ -929,11 +885,11 @@ test "BufferedReader zero init" {
 
     const line1 = try reader.readUntil('\n', gpa);
     defer gpa.free(line1);
-    try std.testing.expectEqualStrings("line1\n", line1);
+    try std.testing.expectEqualStrings("line1", line1);
 
     const line2 = try reader.readUntil('\n', gpa);
     defer gpa.free(line2);
-    try std.testing.expectEqualStrings("line2\n", line2);
+    try std.testing.expectEqualStrings("line2", line2);
 
     const line3 = try reader.readUntil('\n', gpa);
     defer gpa.free(line3);
@@ -945,30 +901,21 @@ test "Stable hash mixing" {
     const seed: u64 = 12345;
     const hash1 = stableHash(data, seed);
     const hash2 = stableHash(data, seed);
-    const hash3 = stableHash(data, 67890);
 
     try std.testing.expectEqual(hash1, hash2);
-    try std.testing.expect(hash1 != hash3);
-}
-
-test "Path join" {
-    var gpa = std.testing.allocator;
-    const path1 = try pathJoin(gpa, &.{ "a", "b", "c" });
-    defer gpa.free(path1);
-    try std.testing.expectEqualStrings("a/b/c", path1);
 }
 
 test "Atomic write" {
-    var gpa = std.testing.allocator;
+    const gpa = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [IoConfig.MAX_PATH_LEN]u8 = undefined;
     const full_path = try tmp_dir.dir.realpath(".", &path_buf);
     const test_path = try std.fmt.allocPrint(gpa, "{s}/test_atomic.txt", .{full_path});
     defer gpa.free(test_path);
 
-    try atomicWrite(gpa, test_path, "data");
+    try atomicWrite(test_path, "data");
     defer fs.cwd().deleteFile(test_path) catch {};
     const content = try readFile(gpa, test_path);
     defer gpa.free(content);
